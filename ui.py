@@ -1,6 +1,8 @@
 import socket
 import threading
 import os
+import base64
+import io
 import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image
@@ -27,6 +29,11 @@ class FullDiscordClone(ctk.CTk):
         self.current_target = "GLOBAL"  
         self.chat_history = {"GLOBAL": []} 
         self.all_rendered_widgets = []
+        self.last_user_list = []
+
+        # username -> PIL.Image, so we can regenerate CTkImages at any size
+        self.default_pil_pfp = Image.new('RGB', (40, 40), color='#5865F2')
+        self.user_pil_pfps = {}
 
         # Server Navigation Rail
         self.server_rail = ctk.CTkFrame(self, width=70, corner_radius=0, fg_color="#1E1F22")
@@ -92,6 +99,8 @@ class FullDiscordClone(ctk.CTk):
 
         self.after(500, self.connect_and_auth)
 
+    # ---------- PFP helpers ----------
+
     def load_saved_profile(self):
         saved_pfp_path = os.getenv("CHAT_PFP_PATH", "")
         if saved_pfp_path and os.path.exists(saved_pfp_path):
@@ -104,6 +113,22 @@ class FullDiscordClone(ctk.CTk):
         self.ctk_pfp = ctk.CTkImage(light_image=self.pil_pfp, dark_image=self.pil_pfp, size=(40, 40))
         self.pfp_label.configure(image=self.ctk_pfp)
 
+    def get_avatar_ctkimage(self, username, size=(40, 40)):
+        pil_img = self.user_pil_pfps.get(username, self.default_pil_pfp)
+        return ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=size)
+
+    def send_own_pfp(self):
+        """Send our current pfp to the server so it can relay it to others."""
+        if not self.client_socket:
+            return
+        try:
+            buf = io.BytesIO()
+            self.pil_pfp.save(buf, format="PNG")
+            b64_data = base64.b64encode(buf.getvalue()).decode('ascii')
+            self.client_socket.sendall(f"PFP:{b64_data}\n".encode('utf-8'))
+        except Exception as e:
+            self.append_system_error(f"Failed to send profile picture: {e}")
+
     def upload_pfp(self):
         file_path = filedialog.askopenfilename(title="Select Profile Picture", filetypes=[("Image Files", "*.png *.jpg *.jpeg")])
         if file_path:
@@ -111,11 +136,22 @@ class FullDiscordClone(ctk.CTk):
                 self.pil_pfp = Image.open(file_path).convert('RGB').resize((40, 40), Image.Resampling.LANCZOS)
                 self.ctk_pfp = ctk.CTkImage(light_image=self.pil_pfp, dark_image=self.pil_pfp, size=(40, 40))
                 self.pfp_label.configure(image=self.ctk_pfp)
+
+                my_name = self.username_entry.get().strip()
+                if my_name:
+                    self.user_pil_pfps[my_name] = self.pil_pfp
+
                 if not os.path.exists(ENV_FILE):
                     open(ENV_FILE, 'w').close()
                 set_key(ENV_FILE, "CHAT_PFP_PATH", file_path)
+
+                self.send_own_pfp()
+                self.reload_current_chat_view()
+                self.update_online_users_ui(self.last_user_list)
             except Exception as e:
                 self.append_system_error(f"Failed to load image: {e}")
+
+    # ---------- Networking ----------
 
     def connect_and_auth(self):
         username = self.username_entry.get().strip()
@@ -137,6 +173,8 @@ class FullDiscordClone(ctk.CTk):
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((HOST, PORT))
             self.client_socket.sendall(f"AUTH:{username}\n".encode('utf-8'))
+            self.user_pil_pfps[username] = self.pil_pfp
+            self.send_own_pfp()
             threading.Thread(target=self.receive_messages_loop, daemon=True).start()
         except Exception as e:
             self.append_system_error(f"Could not link to server at {HOST}: {e}")
@@ -145,7 +183,7 @@ class FullDiscordClone(ctk.CTk):
         buffer = ""  # accumulates partial data between recv() calls
         while True:
             try:
-                data = self.client_socket.recv(4096)
+                data = self.client_socket.recv(65536)
                 if not data:
                     break
                 buffer += data.decode('utf-8')
@@ -178,6 +216,24 @@ class FullDiscordClone(ctk.CTk):
                 my_name = self.username_entry.get().strip()
                 chat_room = sender if sender != my_name else self.current_target
                 self.after(0, self.store_and_render, chat_room, sender, text)
+        elif raw_message.startswith("PFP:"):
+            parts = raw_message.split(":", 2)
+            if len(parts) == 3:
+                sender, b64_data = parts[1], parts[2]
+                self.after(0, self.receive_pfp, sender, b64_data)
+
+    def receive_pfp(self, sender, b64_data):
+        try:
+            raw_bytes = base64.b64decode(b64_data)
+            img = Image.open(io.BytesIO(raw_bytes)).convert('RGB')
+            self.user_pil_pfps[sender] = img
+            # Refresh anything currently on screen that might show this avatar
+            self.reload_current_chat_view()
+            self.update_online_users_ui(self.last_user_list)
+        except Exception:
+            pass  # corrupt/partial image data, just skip it
+
+    # ---------- Chat rendering ----------
 
     def store_and_render(self, chat_room, sender, text):
         if chat_room not in self.chat_history:
@@ -190,6 +246,7 @@ class FullDiscordClone(ctk.CTk):
             self.render_single_message(sender, text)
 
     def update_online_users_ui(self, user_list):
+        self.last_user_list = user_list
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
             
@@ -197,7 +254,8 @@ class FullDiscordClone(ctk.CTk):
         for user in user_list:
             if user == my_name:
                 continue
-            btn = ctk.CTkButton(self.user_list_frame, text=f"🟢 {user}", font=("Arial", 12, "bold"), fg_color="transparent", text_color="#DBDEE1", anchor="w", height=30, hover_color="#35373C", command=lambda u=user: self.select_dm_channel(u))
+            avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
+            btn = ctk.CTkButton(self.user_list_frame, image=avatar_img, text=f"  {user}", compound="left", font=("Arial", 12, "bold"), fg_color="transparent", text_color="#DBDEE1", anchor="w", height=32, hover_color="#35373C", command=lambda u=user: self.select_dm_channel(u))
             btn.pack(fill="x", padx=10, pady=2)
 
     def select_global_channel(self):
@@ -226,7 +284,8 @@ class FullDiscordClone(ctk.CTk):
         msg_frame.pack(fill="x", pady=6, padx=5, anchor="w")
         self.all_rendered_widgets.append(msg_frame)
 
-        avatar_label = ctk.CTkLabel(msg_frame, image=self.ctk_pfp, text="")
+        avatar_img = self.get_avatar_ctkimage(sender, size=(40, 40))
+        avatar_label = ctk.CTkLabel(msg_frame, image=avatar_img, text="")
         avatar_label.pack(side="left", anchor="n", padx=(0, 10))
 
         content_frame = ctk.CTkFrame(msg_frame, fg_color="transparent")
