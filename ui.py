@@ -20,8 +20,9 @@ try:
 except ImportError:
     SOUNDDEVICE_AVAILABLE = False
 
-ENV_FILE = ".env"
-load_dotenv(ENV_FILE)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_FILE, override=True)
 
 HOST = '108.221.36.120'
 PORT = 12145
@@ -370,7 +371,7 @@ class FullDiscordClone(ctk.CTk):
         try:
             if not os.path.exists(ENV_FILE):
                 open(ENV_FILE, "w").close()
-            set_key(ENV_FILE, key, str(value))
+            set_key(ENV_FILE, key, str(value), quote_mode="auto")
             os.environ[key] = str(value)
         except Exception as e:
             self.append_system_error(f"Could not save setting: {e}")
