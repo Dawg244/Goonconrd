@@ -1155,6 +1155,12 @@ class FullDiscordClone(ctk.CTk):
         buttons.pack(pady=8)
         ctk.CTkButton(buttons, text="SAVE SETTINGS", command=save_and_close, width=170, height=38, corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black", font=(FONT_MONO, 11, "bold")).pack(side="left", padx=6)
         ctk.CTkButton(buttons, text="RESET DEFAULTS", command=reset_defaults, width=150, height=38, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 10, "bold")).pack(side="left", padx=6)
+
+        # Closing the Settings window with X should not silently throw away
+        # the selections.  SAVE SETTINGS remains available, but the window
+        # close action now persists the same values automatically.
+        win.protocol("WM_DELETE_WINDOW", save_and_close)
+
     def get_audio_device_names(self):
         if not SOUNDDEVICE_AVAILABLE:
             return [], []
@@ -1550,8 +1556,14 @@ class FullDiscordClone(ctk.CTk):
                 if sender != my_name:
                     self.play_ping_sound()
         elif raw_message == "READY":
+            # The server sends channel/DM history before READY.  A user can
+            # switch rooms while that history is still arriving; if a room
+            # was marked "built" while it was empty, it would stay blank until
+            # the user sent a new message.  Mark every room dirty once history
+            # finishes so the active room is rendered from the complete cache.
             self.loading_history = False
             self._history_ready = True
+            self.chat_room_built.clear()
             self.after(0, self.refresh_dm_list)
             self.after(0, self.reload_current_chat_view)
         elif raw_message.startswith("SERVERPFP:"):
@@ -1694,9 +1706,14 @@ class FullDiscordClone(ctk.CTk):
         self.chat_history[chat_room] = self.chat_history[chat_room][-500:]
         self._save_local_chat_cache()
 
-        if self.current_target == chat_room and (local or not self.loading_history):
-            self.render_single_message(sender, text, room=chat_room)
-            self.chat_room_built.add(chat_room)
+        if self.current_target == chat_room:
+            if self.loading_history and not local:
+                # History is still arriving.  Do not render partial history,
+                # but force this room to rebuild when READY arrives.
+                self.chat_room_built.discard(chat_room)
+            else:
+                self.render_single_message(sender, text, room=chat_room)
+                self.chat_room_built.add(chat_room)
 
         if self.current_target != chat_room and sender != my_name:
             self.unread_counts[chat_room] = self.unread_counts.get(chat_room, 0) + 1
@@ -2183,6 +2200,22 @@ class FullDiscordClone(ctk.CTk):
             pass
 
     def on_close(self):
+        # Persist the currently active settings one final time so exiting the
+        # app cannot discard a change that was already applied in the UI.
+        try:
+            save_persistent_settings({
+                "dm_sound_mode": self.dm_sound_mode,
+                "dm_sound_path": self.dm_sound_path,
+                "voice_input_device": self.voice_device_input,
+                "voice_output_device": self.voice_device_output,
+                "theme": self.theme_name,
+            })
+        except Exception:
+            pass
+        try:
+            self._save_local_chat_cache()
+        except Exception:
+            pass
         if self.in_voice_chat:
             self.stop_voice_chat()
         self.destroy()
