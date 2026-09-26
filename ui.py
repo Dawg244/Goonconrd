@@ -1,87 +1,265 @@
 import socket
 import threading
+import os
 import customtkinter as ctk
+from tkinter import filedialog
+from PIL import Image
+from dotenv import load_dotenv, set_key
 
-# Note: Make sure this matches your actual server machine's local IP address
-HOST = '192.168.1.223'
+ENV_FILE = ".env"
+load_dotenv(ENV_FILE)
+
+HOST = '108.221.36.120'
 PORT = 12145
 
-ctk.set_appearance_mode("System")  
-ctk.set_default_color_theme("blue") 
+ctk.set_appearance_mode("Dark")
 
-class ChatApp(ctk.CTk):
+class FullDiscordClone(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Local Socket Chat")
-        self.geometry("500x550")
+        self.title("Discord Lite")
+        self.geometry("1000x600")
         self.resizable(False, False)
+        self.configure(fg_color="#313338")
 
-        # Username Label
-        self.username_label = ctk.CTkLabel(self, text="Your Handle:", font=("Arial", 12, "bold"))
-        self.username_label.pack(pady=(15, 0), padx=20, anchor="w")
+        self.client_socket = None
+        self.current_target = "GLOBAL"  
+        self.chat_history = {"GLOBAL": []} 
+        self.all_rendered_widgets = []
+
+        # Server Navigation Rail
+        self.server_rail = ctk.CTkFrame(self, width=70, corner_radius=0, fg_color="#1E1F22")
+        self.server_rail.pack(side="left", fill="y")
         
-        # Username Entry
-        self.username_entry = ctk.CTkEntry(self, placeholder_text="Enter username here...", width=460)
-        self.username_entry.insert(0, "User")  
-        self.username_entry.pack(pady=(5, 15), padx=20)
+        self.server_btn = ctk.CTkButton(self.server_rail, text="🏠", width=48, height=48, corner_radius=24, fg_color="#5865F2", font=("Arial", 16, "bold"), command=self.select_global_channel)
+        self.server_btn.pack(pady=12)
 
-        # Log Label
-        self.log_label = ctk.CTkLabel(self, text="Message Log:", font=("Arial", 12, "bold"))
-        self.log_label.pack(padx=20, anchor="w")
+        # Left Channels Sidebar
+        self.channel_sidebar = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color="#2B2D31")
+        self.channel_sidebar.pack(side="left", fill="y")
+
+        self.server_title = ctk.CTkLabel(self.channel_sidebar, text="Main Server", font=("Arial", 14, "bold"), text_color="#F2F3F5")
+        self.server_title.pack(pady=15, padx=15, anchor="w")
+
+        self.channel_btn = ctk.CTkButton(self.channel_sidebar, text="# general-chat", font=("Arial", 12, "bold"), fg_color="#404249", text_color="#FFFFFF", height=32, corner_radius=4, command=self.select_global_channel)
+        self.channel_btn.pack(fill="x", padx=10, pady=5)
+
+        # Profile Picture & Username Panel
+        self.user_section = ctk.CTkFrame(self.channel_sidebar, fg_color="#232428", height=130, corner_radius=0)
+        self.user_section.pack(side="bottom", fill="x")
+
+        self.pfp_label = ctk.CTkLabel(self.user_section, text="", width=40, height=40)
+        self.pfp_label.pack(pady=(12, 2))
         
-        # Chat Log
-        self.chat_log = ctk.CTkTextbox(self, width=460, height=280, activate_scrollbars=True)
-        self.chat_log.configure(state="disabled")  
-        self.chat_log.pack(pady=(5, 15), padx=20)
+        self.load_saved_profile()
 
-        # 🟢 FIXED: Create a bottom frame to hold the input row cleanly
-        self.bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.bottom_frame.pack(fill="x", padx=20, pady=(0, 20))
+        self.pfp_btn = ctk.CTkButton(self.user_section, text="Upload PFP", font=("Arial", 10), fg_color="#383A40", hover_color="#4E5058", height=20, width=90, command=self.upload_pfp)
+        self.pfp_btn.pack(pady=(0, 8))
 
-        # Message Entry (Now inside bottom_frame)
-        self.message_entry = ctk.CTkEntry(self.bottom_frame, placeholder_text="Type a message...", width=340)
+        saved_user = os.getenv("CHAT_USERNAME", "User")
+        self.username_entry = ctk.CTkEntry(self.user_section, width=140, height=28, fg_color="#1E1F22", border_color="#1E1F22", text_color="#F2F3F5", font=("Arial", 11, "bold"), justify="center")
+        self.username_entry.insert(0, saved_user)
+        self.username_entry.pack(pady=(0, 12), padx=15)
+        self.username_entry.bind("<Return>", lambda event: self.connect_and_auth())
+
+        # Right Active User Panel
+        self.member_sidebar = ctk.CTkFrame(self, width=180, corner_radius=0, fg_color="#2B2D31")
+        self.member_sidebar.pack(side="right", fill="y")
+
+        self.member_header = ctk.CTkLabel(self.member_sidebar, text="ONLINE USERS", font=("Arial", 10, "bold"), text_color="#949BA4")
+        self.member_header.pack(padx=15, pady=(15, 5), anchor="w")
+
+        self.user_list_frame = ctk.CTkFrame(self.member_sidebar, fg_color="transparent")
+        self.user_list_frame.pack(fill="both", expand=True)
+
+        # Central Message Arena
+        self.main_chat_area = ctk.CTkFrame(self, fg_color="#313338", corner_radius=0)
+        self.main_chat_area.pack(side="right", fill="both", expand=True)
+
+        self.chat_scroll = ctk.CTkScrollableFrame(self.main_chat_area, fg_color="#313338", label_text="")
+        self.chat_scroll.pack(fill="both", expand=True, padx=10, pady=(15, 10))
+
+        self.input_container = ctk.CTkFrame(self.main_chat_area, fg_color="#313338", height=60, corner_radius=0)
+        self.input_container.pack(fill="x", side="bottom", padx=20, pady=(0, 20))
+
+        self.message_entry = ctk.CTkEntry(self.input_container, placeholder_text="Message #general-chat", height=44, fg_color="#383A40", border_color="#383A40", text_color="#DBDEE1", placeholder_text_color="#949BA4", font=("Arial", 13), corner_radius=8)
         self.message_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.message_entry.bind("<Return>", lambda event: self.start_send_thread())
+        self.message_entry.bind("<Return>", lambda event: self.send_message())
 
-        # Send Button (Now inside bottom_frame)
-        self.send_button = ctk.CTkButton(self.bottom_frame, text="Send", width=100, command=self.start_send_thread)
+        self.send_button = ctk.CTkButton(self.input_container, text="Send", width=80, height=44, fg_color="#5865F2", hover_color="#4752C4", text_color="#FFFFFF", font=("Arial", 13, "bold"), corner_radius=8, command=self.send_message)
         self.send_button.pack(side="right")
 
-    def append_to_log(self, text):
-        self.chat_log.configure(state="normal")
-        self.chat_log.insert("end", text + "\n")
-        self.chat_log.configure(state="disabled")
-        self.chat_log.see("end")  
+        self.after(500, self.connect_and_auth)
 
-    def start_send_thread(self):
-        message = self.message_entry.get().strip()
+    def load_saved_profile(self):
+        saved_pfp_path = os.getenv("CHAT_PFP_PATH", "")
+        if saved_pfp_path and os.path.exists(saved_pfp_path):
+            try:
+                self.pil_pfp = Image.open(saved_pfp_path).convert('RGB').resize((40, 40), Image.Resampling.LANCZOS)
+            except:
+                self.pil_pfp = Image.new('RGB', (40, 40), color='#5865F2')
+        else:
+            self.pil_pfp = Image.new('RGB', (40, 40), color='#5865F2')
+        self.ctk_pfp = ctk.CTkImage(light_image=self.pil_pfp, dark_image=self.pil_pfp, size=(40, 40))
+        self.pfp_label.configure(image=self.ctk_pfp)
+
+    def upload_pfp(self):
+        file_path = filedialog.askopenfilename(title="Select Profile Picture", filetypes=[("Image Files", "*.png *.jpg *.jpeg")])
+        if file_path:
+            try:
+                self.pil_pfp = Image.open(file_path).convert('RGB').resize((40, 40), Image.Resampling.LANCZOS)
+                self.ctk_pfp = ctk.CTkImage(light_image=self.pil_pfp, dark_image=self.pil_pfp, size=(40, 40))
+                self.pfp_label.configure(image=self.ctk_pfp)
+                if not os.path.exists(ENV_FILE):
+                    open(ENV_FILE, 'w').close()
+                set_key(ENV_FILE, "CHAT_PFP_PATH", file_path)
+            except Exception as e:
+                self.append_system_error(f"Failed to load image: {e}")
+    def connect_and_auth(self):
         username = self.username_entry.get().strip()
-
-        if not message:
-            return  
-
         if not username:
-            self.append_to_log("[System Error]: Please enter a username handle.")
+            return
+        
+        if not os.path.exists(ENV_FILE):
+            with open(ENV_FILE, 'w') as f:
+                pass
+        set_key(ENV_FILE, "CHAT_USERNAME", username)
+
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+
+        try:
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((HOST, PORT))
+            self.client_socket.sendall(f"AUTH:{username}".encode('utf-8'))
+            threading.Thread(target=self.receive_messages_loop, daemon=True).start()
+        except Exception as e:
+            self.append_system_error(f"Could not link to server at {HOST}: {e}")
+
+    def receive_messages_loop(self):
+        while True:
+            try:
+                data = self.client_socket.recv(4096)
+                if not data:
+                    break
+                raw_messages = data.decode('utf-8').split("\n")
+                
+                for raw_message in raw_messages:
+                    if not raw_message:
+                        continue
+                    if raw_message.startswith("USERS:"):
+                        users_raw = raw_message.split(":", 1)
+                        if len(users_raw) == 2:
+                            user_list = [u for u in users_raw[1].split(",") if u]
+                            self.after(0, self.update_online_users_ui, user_list)
+                    elif raw_message.startswith("GLOBAL:"):
+                        parts = raw_message.split(":", 2)
+                        if len(parts) == 3:
+                            sender = parts[1]
+                            text = parts[2]
+                            self.after(0, self.store_and_render, "GLOBAL", sender, text)
+                    elif raw_message.startswith("DM:"):
+                        parts = raw_message.split(":", 2)
+                        if len(parts) == 3:
+                            sender = parts[1]
+                            text = parts[2]
+                            my_name = self.username_entry.get().strip()
+                            chat_room = sender if sender != my_name else self.current_target
+                            self.after(0, self.store_and_render, chat_room, sender, text)
+            except:
+                break
+
+    def store_and_render(self, chat_room, sender, text):
+        if chat_room not in self.chat_history:
+            self.chat_history[chat_room] = []
+        
+        msg_data = {"sender": sender, "text": text}
+        self.chat_history[chat_room].append(msg_data)
+        
+        if self.current_target == chat_room:
+            self.render_single_message(sender, text)
+
+    def update_online_users_ui(self, user_list):
+        for widget in self.user_list_frame.winfo_children():
+            widget.destroy()
+            
+        my_name = self.username_entry.get().strip()
+        for user in user_list:
+            if user == my_name:
+                continue
+            btn = ctk.CTkButton(self.user_list_frame, text=f"🟢 {user}", font=("Arial", 12, "bold"), fg_color="transparent", text_color="#DBDEE1", anchor="w", height=30, hover_color="#35373C", command=lambda u=user: self.select_dm_channel(u))
+            btn.pack(fill="x", padx=10, pady=2)
+
+    def select_global_channel(self):
+        self.current_target = "GLOBAL"
+        self.message_entry.configure(placeholder_text="Message #general-chat")
+        self.channel_btn.configure(fg_color="#404249")
+        self.reload_current_chat_view()
+
+    def select_dm_channel(self, username):
+        self.current_target = username
+        self.message_entry.configure(placeholder_text=f"Message @{username}")
+        self.channel_btn.configure(fg_color="transparent")
+        self.reload_current_chat_view()
+
+    def reload_current_chat_view(self):
+        for widget in self.all_rendered_widgets:
+            widget.destroy()
+        self.all_rendered_widgets.clear()
+        
+        messages = self.chat_history.get(self.current_target, [])
+        for msg in messages:
+            self.render_single_message(msg["sender"], msg["text"])
+
+    def render_single_message(self, sender, text):
+        msg_frame = ctk.CTkFrame(self.chat_scroll, fg_color="transparent")
+        msg_frame.pack(fill="x", pady=6, padx=5, anchor="w")
+        self.all_rendered_widgets.append(msg_frame)
+
+        avatar_label = ctk.CTkLabel(msg_frame, image=self.ctk_pfp, text="")
+        avatar_label.pack(side="left", anchor="n", padx=(0, 10))
+
+        content_frame = ctk.CTkFrame(msg_frame, fg_color="transparent")
+        content_frame.pack(side="left", fill="x", expand=True)
+
+        user_label = ctk.CTkLabel(content_frame, text=sender, font=("Arial", 15, "bold"), text_color="#F2F3F5")
+        user_label.pack(anchor="w")
+
+        text_label = ctk.CTkLabel(content_frame, text=text, font=("Arial", 13), text_color="#DBDEE1", justify="left", wraplength=450)
+        text_label.pack(anchor="w", pady=(2, 0))
+
+        self.chat_scroll._parent_canvas.yview_moveto(1.0)
+
+    def append_system_error(self, error_text):
+        err_frame = ctk.CTkFrame(self.chat_scroll, fg_color="transparent")
+        err_frame.pack(fill="x", pady=4, padx=5, anchor="w")
+        self.all_rendered_widgets.append(err_frame)
+        
+        err_label = ctk.CTkLabel(err_frame, text=error_text, font=("Arial", 12, "italic"), text_color="#F23F43", justify="left", wraplength=500)
+        err_label.pack(anchor="w")
+        self.chat_scroll._parent_canvas.yview_moveto(1.0)
+
+    def send_message(self):
+        message = self.message_entry.get().strip()
+        if not message or not self.client_socket:
             return
 
         self.message_entry.delete(0, "end")
-        sent_message = f"{username}: {message}"
-        threading.Thread(target=self.send_socket_data, args=(sent_message,), daemon=True).start()
-
-    def send_socket_data(self, full_message):
+        
+        if self.current_target == "GLOBAL":
+            network_payload = f"GLOBAL:{message}\n"
+        else:
+            network_payload = f"DM:{self.current_target}:{message}\n"
+            
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(4.0) 
-                s.connect((HOST, PORT))
-                data = full_message.encode('utf-8')
-                s.sendall(data)
-                self.append_to_log(full_message)
-        except socket.timeout:
-            self.append_to_log(f"[Error]: Connection timed out. Is the server running at {HOST}?")
+            self.client_socket.sendall(network_payload.encode('utf-8'))
         except Exception as e:
-            self.append_to_log(f"[Error]: Could not connect. ({str(e)})")
+            self.append_system_error(f"Message delivery lost: {e}")
 
 if __name__ == "__main__":
-    app = ChatApp()
+    app = FullDiscordClone()
     app.mainloop()
