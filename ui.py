@@ -284,6 +284,10 @@ class NetraSignals(QObject):
     error = Signal(str)
 
 
+class VoiceTestSignals(QObject):
+    result = Signal(str, bool)
+
+
 class NetworkWorker(QThread):
     line_received = Signal(str)
     disconnected = Signal()
@@ -469,6 +473,8 @@ class FullDiscordClone(QMainWindow):
         self.voice_bytes_received = 0
         self.voice_jitter_ms = 0.0
         self.voice_last_packet_time = 0.0
+        self.voice_test_signals = VoiceTestSignals()
+        self.voice_test_signals.result.connect(self._apply_voice_test_status)
 
         self.pil_profile = self._load_profile_image()
 
@@ -764,6 +770,10 @@ class FullDiscordClone(QMainWindow):
         self.chat_content_layout.setAlignment(Qt.AlignTop)
         self.chat_content_layout.setSpacing(2)
         self.chat_scroll.setWidget(self.chat_content)
+        self._chat_wants_bottom = False
+        self.chat_scroll.verticalScrollBar().rangeChanged.connect(
+            self._on_chat_scroll_range_changed
+        )
         chat_layout.addWidget(self.chat_scroll, 1)
 
         compose = QHBoxLayout()
@@ -1035,8 +1045,12 @@ class FullDiscordClone(QMainWindow):
         footer_layout.addWidget(close_btn)
         outer.addWidget(footer)
     def _test_microphone(self):
+        """Run a bounded microphone test without blocking the Qt GUI thread."""
         if not SOUNDDEVICE_AVAILABLE:
-            self.voice_test_status.setText("sounddevice is not installed. Install it with: python -m pip install sounddevice")
+            self.voice_test_signals.result.emit(
+                "sounddevice is not installed. Install it with: python -m pip install sounddevice",
+                True,
+            )
             return
 
         in_device = self._audio_selection_to_index(self.input_device_combo.currentText())
@@ -1047,6 +1061,7 @@ class FullDiscordClone(QMainWindow):
         self.voice_test_status.style().polish(self.voice_test_status)
 
         def worker():
+            input_stream = None
             try:
                 in_info = sd.query_devices(in_device, "input")
                 out_info = sd.query_devices(out_device, "output")
@@ -1057,21 +1072,45 @@ class FullDiscordClone(QMainWindow):
                 if out_channels < 1:
                     raise RuntimeError(f"Selected output has no output channels: {out_info.get('name', 'unknown')}")
 
-                rate = int(round(float(in_info.get("default_samplerate") or 48000)))
-                out_rate = int(round(float(out_info.get("default_samplerate") or 48000)))
+                rate = max(8000, int(round(float(in_info.get("default_samplerate") or 48000))))
+                out_rate = max(8000, int(round(float(out_info.get("default_samplerate") or 48000))))
                 sd.check_input_settings(device=in_device, samplerate=rate, channels=1, dtype="int16")
                 sd.check_output_settings(device=out_device, samplerate=out_rate, channels=1, dtype="int16")
 
-                duration = 3.0
-                recording = sd.rec(
-                    int(rate * duration),
+                chunks = []
+                target_seconds = 3.0
+
+                def callback(indata, frames, time_info, status):
+                    if status:
+                        # Keep capture alive; the final status text will still
+                        # report the measured signal level.
+                        pass
+                    chunks.append(bytes(indata))
+
+                input_stream = sd.InputStream(
                     samplerate=rate,
                     channels=1,
                     dtype="int16",
                     device=in_device,
-                    blocking=True,
+                    blocksize=1024,
+                    callback=callback,
+                    latency="low",
                 )
-                raw = recording.tobytes()
+                input_stream.start()
+
+                # Hard wall-clock bound: even if a driver behaves badly, this
+                # worker will leave the capture state after a little over 3 sec.
+                deadline = time.monotonic() + target_seconds + 0.35
+                while time.monotonic() < deadline:
+                    time.sleep(0.05)
+
+                try:
+                    input_stream.stop()
+                finally:
+                    input_stream.close()
+                    input_stream = None
+
+                raw = b"".join(chunks)
                 count = len(raw) // 2
                 values = struct.unpack(f"<{count}h", raw[:count * 2]) if count else ()
                 peak = max((abs(v) for v in values), default=0)
@@ -1079,40 +1118,88 @@ class FullDiscordClone(QMainWindow):
                 db_peak = -60.0 if peak <= 0 else 20.0 * math.log10(peak / 32768.0)
                 db_rms = -60.0 if rms <= 0 else 20.0 * math.log10(rms / 32768.0)
 
-                # Play the recording back through the selected output so this
-                # test validates both the mic and speakers/headphones.
-                playback = resample_pcm16_mono(raw, rate, out_rate)
-                sd.play(playback, samplerate=out_rate, device=out_device, blocking=True)
-                sd.stop()
+                # Use the same RawOutputStream path as NETRA voice chat instead
+                # of sd.play(). This is much more reliable for explicitly selected
+                # Windows/WASAPI devices and also proves the exact output path that
+                # real VC uses.
+                playback_error = None
+                playback_stream = None
+                if raw:
+                    try:
+                        playback = resample_pcm16_mono(raw, rate, out_rate)
+                        playback_stream = sd.RawOutputStream(
+                            samplerate=out_rate,
+                            channels=1,
+                            dtype="int16",
+                            device=out_device,
+                            blocksize=1024,
+                            latency="low",
+                        )
+                        playback_stream.start()
+
+                        # Write the complete recording in bounded chunks. RawOutputStream
+                        # accepts the same signed-16-bit byte format used by VC.
+                        chunk_bytes = 1024 * 2
+                        for start in range(0, len(playback), chunk_bytes):
+                            playback_stream.write(playback[start:start + chunk_bytes])
+
+                    except Exception as exc:
+                        playback_error = exc
+                    finally:
+                        try:
+                            if playback_stream is not None:
+                                playback_stream.stop()
+                                playback_stream.close()
+                        except Exception:
+                            pass
 
                 if peak <= 100:
                     msg = (
                         "✗ Microphone opened, but almost no signal was captured "
                         f"(peak {peak}). Check Windows mic permissions / mute state."
                     )
-                    self._set_voice_test_status(msg, True)
+                    if playback_error:
+                        msg += f" Playback also failed: {type(playback_error).__name__}: {playback_error}"
+                    self.voice_test_signals.result.emit(msg, True)
+                elif playback_error:
+                    msg = (
+                        "✓ Mic capture complete // "
+                        f"peak {peak} ({db_peak:.1f} dBFS) // RMS {db_rms:.1f} dBFS // "
+                        f"Playback failed: {type(playback_error).__name__}: {playback_error}"
+                    )
+                    self.voice_test_signals.result.emit(msg, True)
                 else:
                     msg = (
                         "✓ Mic test complete + playback verified // "
                         f"peak {peak} ({db_peak:.1f} dBFS) // RMS {db_rms:.1f} dBFS"
                     )
-                    self._set_voice_test_status(msg, False)
+                    self.voice_test_signals.result.emit(msg, False)
             except Exception as exc:
+                try:
+                    if input_stream is not None:
+                        input_stream.stop()
+                        input_stream.close()
+                except Exception:
+                    pass
                 try:
                     sd.stop()
                 except Exception:
                     pass
-                self._set_voice_test_status(f"✗ Microphone test failed: {type(exc).__name__}: {exc}", True)
+                self.voice_test_signals.result.emit(
+                    f"✗ Microphone test failed: {type(exc).__name__}: {exc}",
+                    True,
+                )
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="NETRA-Mic-Test").start()
+
+    def _apply_voice_test_status(self, text, error):
+        self.voice_test_status.setText(text)
+        self.voice_test_status.setProperty("role", "error" if error else "muted")
+        self.voice_test_status.style().unpolish(self.voice_test_status)
+        self.voice_test_status.style().polish(self.voice_test_status)
 
     def _set_voice_test_status(self, text, error):
-        def apply():
-            self.voice_test_status.setText(text)
-            self.voice_test_status.setProperty("role", "error" if error else "muted")
-            self.voice_test_status.style().unpolish(self.voice_test_status)
-            self.voice_test_status.style().polish(self.voice_test_status)
-        QTimer.singleShot(0, apply)
+        self.voice_test_signals.result.emit(text, error)
 
     # ---------- dialogs / settings ----------
 
@@ -1647,22 +1734,29 @@ class FullDiscordClone(QMainWindow):
         if local:
             self.pending_local_messages.add(key)
         elif sender == self.username and key in self.pending_local_messages:
+            # The server echo is already rendered locally. Do not rebuild the
+            # entire chat view a second time just because the echo arrived.
             self.pending_local_messages.discard(key)
             return
+
         message = {"sender": sender, "text": text, "id": f"{time.time_ns()}"}
         self.chat_history[room].append(message)
         self.chat_history[room] = self.chat_history[room][-500:]
         self._chat_cache_dirty = True
 
-        # During post-login history replay, don't write JSON or rebuild hundreds
-        # of Qt widgets once per packet. READY performs the single final update.
+        # During post-login history replay, don't write JSON or touch the GUI
+        # once per packet. READY performs the single final history render.
         if self.loading_history:
             return
 
         self._save_chat_cache()
         self._chat_cache_dirty = False
+
+        # Live messages are appended in-place. Rebuilding the whole 500-message
+        # view here causes the scrollbar to jump to the top, then back to the
+        # bottom, especially when our own message is echoed by the server.
         if room == self.current_target:
-            self.reload_current_chat_view()
+            self._append_message_widget(message, scroll_to_bottom=True)
 
     def send_message(self):
         text = self.message_entry.text().strip()
@@ -1817,6 +1911,71 @@ class FullDiscordClone(QMainWindow):
         self._render_index = 0
         self._render_messages_in_batches(generation)
 
+    def _append_message_widget(self, msg, scroll_to_bottom=False):
+        """Append one live message without rebuilding the existing chat widgets."""
+        c = self.palette_colors()
+        sender = msg.get("sender", "?")
+        text = msg.get("text", "")
+        edited = "  [edited]" if msg.get("edited") else ""
+
+        card = QFrame(objectName="messageCard")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+
+        avatar = QLabel()
+        avatar.setFixedSize(36, 36)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar_img = self.user_pfps.get(sender, Image.new("RGB", (40, 40), "#0F3D0F"))
+        avatar.setPixmap(self.pil_to_pixmap(avatar_img, (36, 36)))
+        layout.addWidget(avatar, alignment=Qt.AlignTop)
+
+        body = QVBoxLayout()
+        body.setSpacing(1)
+        name = QLabel(sender + edited)
+        name.setStyleSheet(
+            f"color:{c['bright']}; font-family:Consolas; font-size:12px; font-weight:700;"
+        )
+        body.addWidget(name)
+
+        msg_label = QLabel(text)
+        msg_label.setWordWrap(True)
+        msg_label.setStyleSheet(
+            f"color:{c['dim']}; font-family:Consolas; font-size:13px;"
+        )
+        body.addWidget(msg_label)
+        layout.addLayout(body, 1)
+        self.chat_content_layout.addWidget(card)
+
+        if scroll_to_bottom:
+            # Ask the scroll area to follow the bottom. QScrollArea can emit
+            # rangeChanged more than once while Qt recalculates child heights,
+            # so the actual scroll is performed from _on_chat_scroll_range_changed
+            # and again after the layout has settled.
+            self._chat_wants_bottom = True
+            QTimer.singleShot(0, self._scroll_chat_to_bottom)
+            QTimer.singleShot(20, self._scroll_chat_to_bottom)
+
+    def _on_chat_scroll_range_changed(self, _minimum, _maximum):
+        if getattr(self, "_chat_wants_bottom", False):
+            self._scroll_chat_to_bottom()
+
+    def _scroll_chat_to_bottom(self):
+        if not hasattr(self, "chat_scroll"):
+            return
+        self.chat_content_layout.activate()
+        self.chat_content.adjustSize()
+        bar = self.chat_scroll.verticalScrollBar()
+        target = bar.maximum()
+        if target >= 0:
+            bar.setValue(target)
+        # Keep the request alive for this layout cycle. rangeChanged will clear
+        # it after the final size update below.
+        QTimer.singleShot(35, self._clear_chat_bottom_request)
+
+    def _clear_chat_bottom_request(self):
+        self._chat_wants_bottom = False
+
     def _render_messages_in_batches(self, generation, batch_size=35):
         if generation != self._render_generation:
             return
@@ -1824,48 +1983,14 @@ class FullDiscordClone(QMainWindow):
         messages = getattr(self, "_render_messages", [])
         start = getattr(self, "_render_index", 0)
         if start >= len(messages):
-            self.chat_scroll.verticalScrollBar().setValue(
-                self.chat_scroll.verticalScrollBar().maximum()
-            )
+            self._chat_wants_bottom = True
+            self._scroll_chat_to_bottom()
+            QTimer.singleShot(20, self._scroll_chat_to_bottom)
             return
 
-        c = self.palette_colors()
         end = min(start + batch_size, len(messages))
         for msg in messages[start:end]:
-            sender = msg.get("sender", "?")
-            text = msg.get("text", "")
-            edited = "  [edited]" if msg.get("edited") else ""
-
-            card = QFrame(objectName="messageCard")
-            layout = QHBoxLayout(card)
-            layout.setContentsMargins(4, 4, 4, 4)
-            layout.setSpacing(8)
-
-            avatar = QLabel()
-            avatar.setFixedSize(36, 36)
-            avatar.setAlignment(Qt.AlignCenter)
-            avatar_img = self.user_pfps.get(
-                sender, Image.new("RGB", (40, 40), "#0F3D0F")
-            )
-            avatar.setPixmap(self.pil_to_pixmap(avatar_img, (36, 36)))
-            layout.addWidget(avatar, alignment=Qt.AlignTop)
-
-            body = QVBoxLayout()
-            body.setSpacing(1)
-            name = QLabel(sender + edited)
-            name.setStyleSheet(
-                f"color:{c['bright']}; font-family:Consolas; font-size:12px; font-weight:700;"
-            )
-            body.addWidget(name)
-
-            msg_label = QLabel(text)
-            msg_label.setWordWrap(True)
-            msg_label.setStyleSheet(
-                f"color:{c['dim']}; font-family:Consolas; font-size:13px;"
-            )
-            body.addWidget(msg_label)
-            layout.addLayout(body, 1)
-            self.chat_content_layout.addWidget(card)
+            self._append_message_widget(msg, scroll_to_bottom=False)
 
         self._render_index = end
         QTimer.singleShot(0, lambda g=generation: self._render_messages_in_batches(g, batch_size))
@@ -2115,6 +2240,10 @@ class FullDiscordClone(QMainWindow):
             self.voice_stats_label.setText("voice offline")
 
     # ---------- misc ----------
+
+    def _refresh_voice_user_settings(self):
+        """Refresh the per-user voice controls shown in Settings."""
+        return self._refresh_voice_user_settings_impl()
 
     def _refresh_voice_user_settings_impl(self):
         while self.voice_users_settings_layout.count():
