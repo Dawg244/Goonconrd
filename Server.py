@@ -3,11 +3,13 @@ import threading
 import os
 import json
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HOST = "0.0.0.0"
 PORT = 12145
 VOICE_PORT = 12146
 
-LOG_FILE = "chat_log.json"
+LOG_FILE = os.path.join(BASE_DIR, "chat_log.json")
+USERS_FILE = os.path.join(BASE_DIR, "netra_users.json")
 MAX_HISTORY_PER_CHANNEL = 200
 
 clients = {}        # username -> connection
@@ -53,6 +55,47 @@ def load_message_log():
 
 
 message_log = load_message_log()
+
+
+def load_registered_users():
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return {str(x) for x in data if str(x).strip()}
+            if isinstance(data, dict):
+                return {str(x) for x in data.keys() if str(x).strip()}
+        except Exception as e:
+            print(f"[WARN] Could not read {USERS_FILE}: {e}")
+    # Recover names from existing chat history so upgrading does not lose users.
+    found = set()
+    for entry in message_log.get("global", []):
+        if entry.get("sender"):
+            found.add(str(entry["sender"]))
+    for key, entries in message_log.get("dms", {}).items():
+        found.update(x for x in key.split("|") if x)
+        for entry in entries:
+            if entry.get("sender"):
+                found.add(str(entry["sender"]))
+    return found
+
+
+registered_users = load_registered_users()
+registered_users_lock = threading.Lock()
+
+
+def save_registered_users():
+    tmp = USERS_FILE + ".tmp"
+    try:
+        with registered_users_lock:
+            data = sorted(registered_users, key=str.lower)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, USERS_FILE)
+    except Exception as e:
+        print(f"[ERROR] Could not save {USERS_FILE}: {e}")
+
 
 
 def save_message_log():
@@ -120,10 +163,18 @@ def process_line(message, username, connection, address):
 
     if message.startswith("AUTH:"):
         username = message.split(":", 1)[1].strip()
+        if not username:
+            return username
+        with registered_users_lock:
+            is_new_user = username not in registered_users
+            registered_users.add(username)
+        if is_new_user:
+            save_registered_users()
         with clients_lock:
             clients[username] = connection
             existing_pfps = dict(clients_pfp)
             current_server_icon = server_icon_b64
+            online_names = sorted(clients.keys())
         with presence_lock:
             current_voice_names = list(voice_presence_users)
         with log_lock:
@@ -166,6 +217,14 @@ def process_line(message, username, connection, address):
                 connection.sendall(f"SERVERPFP:{current_server_icon}\n".encode('utf-8'))
             except Exception:
                 pass
+        # Persistent account list includes users who are currently offline.
+        with registered_users_lock:
+            all_user_names = sorted(registered_users, key=str.lower)
+        try:
+            connection.sendall(("USERS:" + ",".join(all_user_names) + "\n").encode('utf-8'))
+            connection.sendall(("ONLINE:" + ",".join(online_names) + "\n").encode('utf-8'))
+        except Exception:
+            pass
         # ...and who's currently in voice.
         try:
             connection.sendall(("VOICEUSERS:" + ",".join(current_voice_names) + "\n").encode('utf-8'))
@@ -249,10 +308,17 @@ def broadcast(message_str):
 
 
 def broadcast_user_list():
+    # USERS = every registered account (online + offline)
+    # ONLINE = accounts connected right now
+    with registered_users_lock:
+        all_names = sorted(registered_users, key=str.lower)
     with clients_lock:
-        names = list(clients.keys())
-    user_list_str = "USERS:" + ",".join(sorted(names)) + "\n"
-    broadcast(user_list_str)
+        online_names = sorted(clients.keys(), key=str.lower)
+    payload = (
+        "USERS:" + ",".join(all_names) + "\n"
+        + "ONLINE:" + ",".join(online_names) + "\n"
+    )
+    broadcast(payload)
 
 
 def broadcast_voice_user_list():

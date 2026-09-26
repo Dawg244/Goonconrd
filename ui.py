@@ -10,6 +10,7 @@ import tempfile
 import subprocess
 import base64
 import json
+import re
 import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image
@@ -99,6 +100,47 @@ def load_persistent_settings():
                 defaults.update({k: data[k] for k in defaults if k in data})
     except Exception:
         pass
+
+    # Older NETRA builds could save the device NAME.  A name is not
+    # necessarily unique (e.g. the same webcam can appear as DirectSound,
+    # WASAPI, and WDM-KS), so convert old names to an exact device ID.
+    if SOUNDDEVICE_AVAILABLE:
+        try:
+            devices = sd.query_devices()
+
+            def migrate_device(value, want_input):
+                if value is None or value == "" or value == "Default":
+                    return None
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, str):
+                    m = re.match(r"^\s*\[(\d+)\]", value)
+                    if m:
+                        return int(m.group(1))
+                    matches = []
+                    for idx, dev in enumerate(devices):
+                        name = str(dev.get("name", "")).strip()
+                        channels = int(dev.get(
+                            "max_input_channels" if want_input else "max_output_channels", 0
+                        ))
+                        if channels > 0 and name == value:
+                            matches.append(idx)
+                    # If an old name maps to several host-api entries,
+                    # use the first valid exact match rather than passing
+                    # the ambiguous string to sounddevice.
+                    return matches[0] if matches else None
+                return None
+
+            defaults["voice_input_device"] = migrate_device(
+                defaults["voice_input_device"], True
+            )
+            defaults["voice_output_device"] = migrate_device(
+                defaults["voice_output_device"], False
+            )
+        except Exception:
+            defaults["voice_input_device"] = None
+            defaults["voice_output_device"] = None
+
     return defaults
 
 
@@ -123,6 +165,7 @@ class FullDiscordClone(ctk.CTk):
         self.chat_history = {"GLOBAL": []}
         self.all_rendered_widgets = []
         self.last_user_list = []
+        self.online_user_set = set()
         self.last_voice_user_list = []
         self.sidebar_mode = "server"  # "server" or "dms"
 
@@ -282,6 +325,8 @@ class FullDiscordClone(ctk.CTk):
 
         my_name = self.username_entry.get().strip()
         partners = set(self.chat_history.keys()) - {"GLOBAL"}
+        # last_user_list is the persistent account list sent by the server,
+        # so offline accounts remain available for DMs.
         partners |= set(u for u in self.last_user_list if u != my_name)
         partners.discard(my_name)
 
@@ -451,6 +496,12 @@ class FullDiscordClone(ctk.CTk):
         win.grab_set()
 
         ctk.CTkLabel(win, text="NETRA // SETTINGS", font=(FONT_MONO, 16, "bold"), text_color=FG_BRIGHT).pack(pady=(18, 12))
+        ctk.CTkLabel(
+            win,
+            text=f"Saved automatically to: {SETTINGS_FILE}",
+            font=(FONT_MONO, 8),
+            text_color=FG_FAINT,
+        ).pack(pady=(0, 8))
 
         sound_frame = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=0)
         sound_frame.pack(fill="x", padx=20, pady=8)
@@ -500,8 +551,8 @@ class FullDiscordClone(ctk.CTk):
 
         def save_and_close():
             mode = sound_var.get()
-            inp = None if input_var.get() == "Default" else input_var.get()
-            out = None if output_var.get() == "Default" else output_var.get()
+            inp = self.audio_selection_to_index(input_var.get())
+            out = self.audio_selection_to_index(output_var.get())
             path = self.dm_sound_path if mode == "custom" else self.dm_sound_path
             if self.save_settings_file(mode, path, inp, out):
                 status.configure(text="✓ SETTINGS SAVED", text_color=FG_BRIGHT)
@@ -526,17 +577,51 @@ class FullDiscordClone(ctk.CTk):
             devices = sd.query_devices()
             inputs = []
             outputs = []
-            for d in devices:
+            for idx, d in enumerate(devices):
                 name = str(d.get("name", "")).strip()
                 if not name:
                     continue
-                if int(d.get("max_input_channels", 0)) > 0 and name not in inputs:
-                    inputs.append(name)
-                if int(d.get("max_output_channels", 0)) > 0 and name not in outputs:
-                    outputs.append(name)
+                label = f"[{idx}] {name}"
+                if int(d.get("max_input_channels", 0)) > 0:
+                    inputs.append(label)
+                if int(d.get("max_output_channels", 0)) > 0:
+                    outputs.append(label)
             return inputs, outputs
         except Exception:
             return [], []
+
+    @staticmethod
+    def audio_selection_to_index(value):
+        if not value or value == "Default":
+            return None
+        try:
+            if value.startswith("[") and "]" in value:
+                return int(value[1:value.index("]")])
+            # Migrate old settings that stored the raw device name.
+            if SOUNDDEVICE_AVAILABLE:
+                for idx, d in enumerate(sd.query_devices()):
+                    if str(d.get("name", "")).strip() == value:
+                        return idx
+        except Exception:
+            pass
+        return None
+
+    def audio_index_to_selection(self, value, values):
+        if value is None:
+            return "Default"
+        try:
+            idx = int(value)
+            prefix = f"[{idx}] "
+            for item in values:
+                if item.startswith(prefix):
+                    return item
+        except Exception:
+            pass
+        if isinstance(value, str):
+            for item in values:
+                if item == value or item.endswith(" " + value):
+                    return item
+        return "Default"
 
     # ---------- Networking ----------
 
@@ -595,6 +680,10 @@ class FullDiscordClone(ctk.CTk):
             users_raw = raw_message.split(":", 1)[1]
             user_list = [u for u in users_raw.split(",") if u]
             self.after(0, self.update_online_users_ui, user_list)
+        elif raw_message.startswith("ONLINE:"):
+            names_raw = raw_message.split(":", 1)[1]
+            online_list = [u for u in names_raw.split(",") if u]
+            self.after(0, self.update_online_presence_ui, online_list)
         elif raw_message.startswith("HIST_GLOBAL:"):
             parts = raw_message.split(":", 2)
             if len(parts) == 3:
@@ -685,20 +774,33 @@ class FullDiscordClone(ctk.CTk):
             row = ctk.CTkLabel(self.voice_user_frame, image=avatar_img, text=f"  {user}", compound="left", font=(FONT_MONO, 12, "bold"), text_color=FG_BRIGHT, anchor="w")
             row.pack(fill="x", padx=10, pady=2)
 
-    def update_online_users_ui(self, user_list):
+    def update_online_presence_ui(self, user_list):
+        self.online_user_set = set(user_list)
+        self.update_online_users_ui(self.last_user_list, force=True)
+
+    def update_online_users_ui(self, user_list, force=False):
         normalized = list(dict.fromkeys(user_list))
-        if normalized == self.last_user_list:
+        if normalized == self.last_user_list and not force:
             return
         self.last_user_list = normalized
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
 
         my_name = self.username_entry.get().strip()
-        for user in user_list:
+        for user in sorted(user_list, key=str.lower):
             if user == my_name:
                 continue
             avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
-            btn = ctk.CTkButton(self.user_list_frame, image=avatar_img, text=f"  {user}", compound="left", font=(FONT_MONO, 12, "bold"), corner_radius=0, fg_color="transparent", text_color=FG_BRIGHT, anchor="w", height=32, hover_color=BTN_HOVER, command=lambda u=user: self.select_dm_channel(u))
+            online = user in self.online_user_set
+            status = "●" if online else "○"
+            status_color = FG_BRIGHT if online else FG_FAINT
+            btn = ctk.CTkButton(
+                self.user_list_frame, image=avatar_img,
+                text=f"  {status} {user}", compound="left",
+                font=(FONT_MONO, 12, "bold"), corner_radius=0,
+                fg_color="transparent", text_color=(FG_BRIGHT if online else FG_DIM),
+                anchor="w", height=32, hover_color=BTN_HOVER,
+                command=lambda u=user: self.select_dm_channel(u))
             btn.pack(fill="x", padx=10, pady=2)
 
         if self.sidebar_mode == "dms":
@@ -792,8 +894,23 @@ class FullDiscordClone(ctk.CTk):
             self.voice_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
             self.voice_socket.sendto(f"REGISTER:{username}".encode('utf-8'), (HOST, VOICE_PORT))
 
-            input_device = self.voice_device_input or None
-            output_device = self.voice_device_output or None
+            input_device = self.voice_device_input
+            output_device = self.voice_device_output
+
+            # Never pass a duplicate device NAME to sounddevice.  NETRA
+            # always uses a concrete numeric device ID here.
+            if isinstance(input_device, str) or isinstance(output_device, str):
+                self.append_system_error(
+                    "NETRA voice settings contained an old device name. "
+                    "Open Settings, select the exact [ID] device, then SAVE SETTINGS."
+                )
+                raise RuntimeError("old/ambiguous audio device setting")
+
+            if input_device is not None:
+                sd.check_input_settings(device=input_device, samplerate=VOICE_RATE, channels=VOICE_CHANNELS, dtype='int16')
+            if output_device is not None:
+                sd.check_output_settings(device=output_device, samplerate=VOICE_RATE, channels=VOICE_CHANNELS, dtype='int16')
+
             self.voice_input_stream = sd.RawInputStream(
                 samplerate=VOICE_RATE, blocksize=VOICE_CHUNK, dtype='int16',
                 channels=VOICE_CHANNELS, device=input_device, latency="low")
