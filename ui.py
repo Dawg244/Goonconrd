@@ -1,7 +1,10 @@
+import array
 import base64
 import io
 import json
 import math
+import hashlib
+import mimetypes
 import os
 import queue
 import socket
@@ -11,6 +14,7 @@ import tempfile
 import threading
 import time
 import wave
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,7 +30,7 @@ except ImportError:
 
 try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, QSize
-    from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap
+    from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QCursor
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -43,6 +47,7 @@ try:
         QListWidgetItem,
         QMainWindow,
         QMessageBox,
+        QMenu,
         QPushButton,
         QScrollArea,
         QSizePolicy,
@@ -84,6 +89,10 @@ except Exception:
 ENV_FILE = os.path.join(CONFIG_DIR, ".env")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 CHAT_CACHE_FILE = os.path.join(CONFIG_DIR, "chat_cache.json")
+FILE_CACHE_DIR = os.path.join(CONFIG_DIR, "files")
+os.makedirs(FILE_CACHE_DIR, exist_ok=True)
+MAX_FILE_SIZE = 50 * 1024 * 1024
+FILE_CHUNK_SIZE = 24 * 1024
 PROFILE_IMAGE_FILE = os.path.join(CONFIG_DIR, "profile.png")
 ICON_DIR = os.path.join(BASE_DIR, "assets", "icons")
 os.makedirs(ICON_DIR, exist_ok=True)
@@ -91,7 +100,7 @@ load_dotenv(ENV_FILE, override=True)
 
 DEFAULT_HOST = "108.221.36.120"
 PORT = 12145
-VOICE_RATE_DEFAULT = 24000
+VOICE_RATE_DEFAULT = 32000
 VOICE_CHANNELS = 1
 VOICE_CHUNK = 1024
 
@@ -194,6 +203,56 @@ def resample_pcm16_mono(data: bytes, src_rate: int, dst_rate: int) -> bytes:
             value = int(src[left] + (src[left + 1] - src[left]) * frac)
         struct.pack_into("<h", out, i * 2, max(-32768, min(32767, value)))
     return bytes(out)
+
+
+def format_file_size(size):
+    size = float(size or 0)
+    units = ["B", "KB", "MB", "GB"]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def local_file_path(file_id, filename):
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(filename or "file"))
+    return os.path.join(FILE_CACHE_DIR, f"{file_id}_{safe}")
+
+
+class StreamingPCMResampler:
+    """Stateful mono PCM resampler that preserves phase across packets."""
+
+    def __init__(self, src_rate: int, dst_rate: int):
+        self.src_rate = int(src_rate)
+        self.dst_rate = int(dst_rate)
+        self.step = self.src_rate / self.dst_rate if self.dst_rate else 1.0
+        self.samples = array.array("h")
+        self.position = 0.0
+
+    def process(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        if self.src_rate == self.dst_rate:
+            return data
+        incoming = array.array("h")
+        incoming.frombytes(data[:len(data) - (len(data) % 2)])
+        if incoming:
+            self.samples.extend(incoming)
+        if len(self.samples) < 2:
+            return b""
+        out = array.array("h")
+        while self.position + 1.0 < len(self.samples):
+            left = int(self.position)
+            frac = self.position - left
+            value = int(self.samples[left] + (self.samples[left + 1] - self.samples[left]) * frac)
+            out.append(max(-32768, min(32767, value)))
+            self.position += self.step
+        consume = min(max(0, int(self.position)), max(0, len(self.samples) - 1))
+        if consume:
+            del self.samples[:consume]
+            self.position -= consume
+        return out.tobytes()
 
 
 def save_settings(data: dict) -> None:
@@ -374,6 +433,10 @@ class AuthDialog(QDialog):
         register.clicked.connect(lambda: self.submit("REGISTER"))
         layout.addWidget(register)
 
+        offline = QPushButton("CONTINUE OFFLINE")
+        offline.clicked.connect(lambda: self.authenticated.emit("OFFLINE", username, ""))
+        layout.addWidget(offline)
+
         footer = QLabel(
             "Your account is stored on the NETRA main server.\n"
             f"Server: {DEFAULT_HOST}:{PORT}"
@@ -407,6 +470,24 @@ class AuthDialog(QDialog):
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
+
+class HoverMessageCard(QFrame):
+    hovered = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("messageCard")
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setMouseTracking(True)
+
+    def enterEvent(self, event):
+        self.hovered.emit(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.hovered.emit(False)
+        super().leaveEvent(event)
+
 
 class FullDiscordClone(QMainWindow):
     def __init__(self):
@@ -443,10 +524,25 @@ class FullDiscordClone(QMainWindow):
         self.presence_status = {}
         self.custom_status = {}
         self.typing_users = {}
+        self.pending_local_message_ids = set()
+        self.reply_target = None
+        self.message_card_widgets = {}
         self.voice_activity = {}
         self.loading_history = False
         self._chat_cache_dirty = False
         self._render_generation = 0
+        self.offline_mode = False
+        self._last_password = ""
+        self._last_auth_mode = "LOGIN"
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setInterval(3000)
+        self._reconnect_timer.timeout.connect(self._attempt_smart_reconnect)
+        self._reconnect_attempts = 0
+        self._outbox = []
+        self._pending_file_sends = {}
+        self._incoming_file_transfers = {}
+        self._file_send_lock = threading.Lock()
+        self._file_receive_lock = threading.Lock()
 
         self.voice_muted = False
         self.in_voice_chat = False
@@ -455,6 +551,9 @@ class FullDiscordClone(QMainWindow):
         self.voice_input_rate = 48000
         self.voice_output_rate = 48000
         self.voice_play_queue = queue.Queue(maxsize=80)
+        self.voice_resamplers = {}
+        self.voice_send_resampler = None
+        self.voice_prebuffer_packets = 3
         self.voice_deafened = bool(self.settings.get("voice_deafen", False))
         self.voice_ptt = bool(self.settings.get("voice_ptt", False))
         self.voice_ptt_down = False
@@ -527,7 +626,14 @@ class FullDiscordClone(QMainWindow):
         QFrame#panelAlt {{ background: {c['panel_alt']}; border: none; }}
         QFrame#chat {{ background: {c['root']}; border: none; }}
         QFrame#serverBar {{ background: {c['panel']}; border: none; }}
-        QFrame#messageCard {{ background: transparent; border: none; }}
+        QFrame#messageCard {{ background: transparent; border: 1px solid transparent; border-radius: 2px; }}
+        QFrame#messageCard:hover {{ background: {c['hover']}; border: 1px solid {c['border']}; }}
+        QLabel[role="messageText"] {{ color: {c['dim']}; font-family: Consolas; font-size: 13px; }}
+        QFrame#messageCard:hover QLabel[role="messageText"] {{ color: {c['bright']}; }}
+        QLabel[role="replyPreview"] {{ color: {c['faint']}; font-family: Consolas; font-size: 10px; }}
+        QLabel[role="reactionRow"] {{ color: {c['bright']}; font-family: Consolas; font-size: 11px; }}
+        QPushButton#messageActionButton {{ background: {c['button']}; color: {c['dim']}; border: 1px solid {c['border']}; padding: 1px 4px; min-width: 48px; max-width: 68px; min-height: 22px; max-height: 22px; font-size: 9px; }}
+        QPushButton#messageActionButton:hover {{ background: {c['hover']}; color: {c['bright']}; }}
         QFrame#settingsPanel {{ background: {c['root']}; border: 1px solid {c['border']}; }}
         QFrame#settingsSection {{ background: {c['panel']}; border: none; }}
 
@@ -676,12 +782,12 @@ class FullDiscordClone(QMainWindow):
         self.random_button.clicked.connect(lambda: self.select_channel("random"))
         side.addWidget(self.random_button)
 
-        self.voice_button = QPushButton("🎤 Join Voice")
+        self.voice_button = QPushButton("JOIN VOICE")
         self.voice_button.setFixedHeight(32)
         self.voice_button.clicked.connect(self.toggle_voice_chat)
         side.addWidget(self.voice_button)
 
-        self.voice_mute_button = QPushButton("🔇 Mute Mic")
+        self.voice_mute_button = QPushButton("MUTE MIC")
         self.voice_mute_button.setFixedHeight(28)
         self.voice_mute_button.clicked.connect(self.toggle_voice_mute)
         side.addWidget(self.voice_mute_button)
@@ -742,7 +848,7 @@ class FullDiscordClone(QMainWindow):
         self.server_connect_btn = QPushButton("CONNECT")
         self.server_connect_btn.setFixedWidth(90)
         self.server_connect_btn.setFixedHeight(30)
-        self.server_connect_btn.clicked.connect(self.connect_and_auth)
+        self.server_connect_btn.clicked.connect(self._manual_connect)
         server_bar_layout.addWidget(self.server_connect_btn)
         server_bar_layout.addStretch(1)
         self.server_status_label = QLabel("offline")
@@ -776,6 +882,23 @@ class FullDiscordClone(QMainWindow):
         )
         chat_layout.addWidget(self.chat_scroll, 1)
 
+        compose_wrap = QVBoxLayout()
+        compose_wrap.setSpacing(4)
+
+        self.reply_banner = QFrame(objectName="panelAlt")
+        self.reply_banner.setVisible(False)
+        reply_banner_layout = QHBoxLayout(self.reply_banner)
+        reply_banner_layout.setContentsMargins(8, 4, 8, 4)
+        reply_banner_layout.setSpacing(6)
+        self.reply_banner_label = QLabel()
+        self.reply_banner_label.setProperty("role", "muted")
+        reply_banner_layout.addWidget(self.reply_banner_label, 1)
+        self.reply_cancel_button = QPushButton("CANCEL")
+        self.reply_cancel_button.setFixedSize(24, 20)
+        self.reply_cancel_button.clicked.connect(self._clear_reply_target)
+        reply_banner_layout.addWidget(self.reply_cancel_button)
+        compose_wrap.addWidget(self.reply_banner)
+
         compose = QHBoxLayout()
         compose.setSpacing(6)
         self.message_entry = QLineEdit()
@@ -783,11 +906,20 @@ class FullDiscordClone(QMainWindow):
         self.message_entry.setFixedHeight(44)
         self.message_entry.returnPressed.connect(self.send_message)
         compose.addWidget(self.message_entry, 1)
+        self.file_button = QPushButton("FILE")
+        self.file_button.setFixedSize(58, 44)
+        self.file_button.clicked.connect(self.choose_file_to_send)
+        compose.addWidget(self.file_button)
+        self.poll_button = QPushButton("POLL")
+        self.poll_button.setFixedSize(58, 44)
+        self.poll_button.clicked.connect(self.create_poll)
+        compose.addWidget(self.poll_button)
         self.send_button = QPushButton("SEND")
         self.send_button.setFixedSize(80, 44)
         self.send_button.clicked.connect(self.send_message)
         compose.addWidget(self.send_button)
-        chat_layout.addLayout(compose)
+        compose_wrap.addLayout(compose)
+        chat_layout.addLayout(compose_wrap)
         root.addWidget(self.chat_frame, 1)
 
         # ---------------- right member panel ----------------
@@ -796,11 +928,16 @@ class FullDiscordClone(QMainWindow):
         mem = QVBoxLayout(self.members)
         mem.setContentsMargins(10, 10, 10, 10)
         mem.setSpacing(5)
-        self.voice_header = QLabel("IN VOICE 🔊")
+        self.voice_header = QLabel("IN VOICE")
         mem.addWidget(self.voice_header)
         self.voice_user_list = QListWidget()
         self.voice_user_list.setFixedHeight(125)
         mem.addWidget(self.voice_user_list)
+        self.voice_radar_label = QLabel("VOICE RADAR\nno active speakers")
+        self.voice_radar_label.setProperty("role", "muted")
+        self.voice_radar_label.setWordWrap(True)
+        self.voice_radar_label.setMinimumHeight(70)
+        mem.addWidget(self.voice_radar_label)
         self.members_header = QLabel("MEMBERS")
         mem.addWidget(self.members_header)
         self.members_list = QListWidget()
@@ -915,7 +1052,7 @@ class FullDiscordClone(QMainWindow):
         vl.addWidget(self.voice_test_status)
 
         test_row = QHBoxLayout()
-        test_btn = QPushButton("🎙 TEST MICROPHONE (3 SEC)")
+        test_btn = QPushButton("TEST MICROPHONE (3 SEC)")
         test_btn.setFixedHeight(30)
         test_btn.clicked.connect(self._test_microphone)
         test_row.addWidget(test_btn)
@@ -979,6 +1116,15 @@ class FullDiscordClone(QMainWindow):
             cb.stateChanged.connect(lambda value, a=attr: setattr(self, a, bool(value)))
             content_layout.addWidget(cb)
 
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Voice profile"))
+        self.voice_profile_combo = QComboBox()
+        self.voice_profile_combo.addItems(["Casual", "Clear Voice", "Recording", "Low Bandwidth"])
+        self.voice_profile_combo.setCurrentText(self.settings.get("voice_profile", "Casual"))
+        self.voice_profile_combo.currentTextChanged.connect(self._apply_voice_profile)
+        profile_row.addWidget(self.voice_profile_combo)
+        content_layout.addLayout(profile_row)
+
         self.voice_stats_label = QLabel("Voice stats: waiting for a call")
         self.voice_stats_label.setProperty("role", "muted")
         self.voice_stats_label.setWordWrap(True)
@@ -1005,10 +1151,10 @@ class FullDiscordClone(QMainWindow):
         hub_grid.setColumnStretch(0, 1)
         hub_grid.setColumnStretch(1, 1)
         actions = [
-            ("👤 PROFILE / PFP", self.upload_pfp),
-            ("✏ CHANGE USERNAME", self.rename_username),
-            ("🎨 THEMES", lambda: self.theme_combo.setFocus()),
-            ("⛶ FULLSCREEN", self.toggle_fullscreen),
+            ("PROFILE / PFP", self.upload_pfp),
+            ("CHANGE USERNAME", self.rename_username),
+            ("THEMES", lambda: self.theme_combo.setFocus()),
+            ("FULLSCREEN", self.toggle_fullscreen),
         ]
         for i, (label, fn) in enumerate(actions):
             b = QPushButton(label)
@@ -1203,6 +1349,12 @@ class FullDiscordClone(QMainWindow):
 
     # ---------- dialogs / settings ----------
 
+    def _manual_connect(self):
+        if self._last_password:
+            self.connect_and_auth(self._last_auth_mode or "LOGIN", self.username, self._last_password)
+        else:
+            self.show_auth()
+
     def show_auth(self):
         if self.authenticated:
             return
@@ -1292,6 +1444,26 @@ class FullDiscordClone(QMainWindow):
                 return None
         return None
 
+    def _apply_voice_profile(self, name):
+        profiles = {
+            "Casual": {"voice_quality": "High", "voice_volume": 1.25, "voice_mic_gain": 1.0, "voice_noise_gate": True, "voice_agc": True},
+            "Clear Voice": {"voice_quality": "Ultra", "voice_volume": 1.20, "voice_mic_gain": 1.10, "voice_noise_gate": True, "voice_agc": True},
+            "Recording": {"voice_quality": "Ultra", "voice_volume": 1.00, "voice_mic_gain": 0.90, "voice_noise_gate": False, "voice_agc": False},
+            "Low Bandwidth": {"voice_quality": "Low", "voice_volume": 1.25, "voice_mic_gain": 1.0, "voice_noise_gate": True, "voice_agc": True},
+        }
+        cfg = profiles.get(name)
+        if not cfg or not hasattr(self, "quality_combo"):
+            return
+        self.voice_quality = cfg["voice_quality"]
+        self.voice_volume = cfg["voice_volume"]
+        self.voice_mic_gain = cfg["voice_mic_gain"]
+        self.voice_noise_gate = cfg["voice_noise_gate"]
+        self.voice_agc = cfg["voice_agc"]
+        self.quality_combo.setCurrentText(self.voice_quality)
+        self.volume_slider.setValue(int(self.voice_volume * 100))
+        self.mic_slider.setValue(int(self.voice_mic_gain * 100))
+        self.settings["voice_profile"] = name
+
     def save_settings_from_ui(self):
         self.voice_volume = self.volume_slider.value() / 100.0
         self.voice_mic_gain = self.mic_slider.value() / 100.0
@@ -1302,6 +1474,7 @@ class FullDiscordClone(QMainWindow):
             "dm_sound_path": self.settings.get("dm_sound_path", ""),
             "voice_input_device": self._audio_selection_to_index(self.input_device_combo.currentText()),
             "voice_output_device": self._audio_selection_to_index(self.output_device_combo.currentText()),
+            "voice_profile": self.voice_profile_combo.currentText() if hasattr(self, "voice_profile_combo") else self.settings.get("voice_profile", "Casual"),
             "voice_volume": self.voice_volume,
             "voice_mic_gain": self.voice_mic_gain,
             "voice_quality": self.voice_quality,
@@ -1450,8 +1623,22 @@ class FullDiscordClone(QMainWindow):
 
     # ---------- network ----------
 
-    def connect_and_auth(self, mode, username, password):
-        self.username = username
+    def connect_and_auth(self, mode, username, password, silent=False):
+        self.username = username or self.username
+        if mode == "OFFLINE":
+            self.offline_mode = True
+            self.authenticated = False
+            self._stop_reconnect_timer()
+            if self.auth_dialog:
+                self.auth_dialog.accept()
+                self.auth_dialog = None
+            self.server_status_label.setText("offline mode")
+            self.chat_status_label.setText("offline mode // cached data")
+            self.reload_current_chat_view()
+            return
+        self.offline_mode = False
+        self._last_password = password
+        self._last_auth_mode = mode
         self.server_host = DEFAULT_HOST
         self.server_port = PORT
         if self.client_socket:
@@ -1470,6 +1657,7 @@ class FullDiscordClone(QMainWindow):
                 pass
             sock.settimeout(None)
             self.client_socket = sock
+            self._reconnect_attempts = 0
             encoded = base64.b64encode(password.encode("utf-8")).decode("ascii")
             sock.sendall(f"{mode}:{username}:{encoded}\n".encode("utf-8"))
             if self.network_worker:
@@ -1486,13 +1674,43 @@ class FullDiscordClone(QMainWindow):
                 self.show_error(str(exc))
 
     def _network_error(self, message):
-        self.chat_status_label.setText("network error")
+        self.chat_status_label.setText("network error // offline cache active")
         if not self.authenticated and self.auth_dialog:
             self.auth_dialog.status.setText(message)
+        if self._last_password and not self.offline_mode:
+            self._start_smart_reconnect()
 
     def _network_disconnected(self):
-        self.chat_status_label.setText("disconnected")
         self.authenticated = False
+        if self.offline_mode:
+            self.server_status_label.setText("offline mode")
+            self.chat_status_label.setText("offline mode // cached data")
+            return
+        self.server_status_label.setText("disconnected // reconnecting")
+        self.chat_status_label.setText("disconnected // cached data available")
+        self._start_smart_reconnect()
+
+    def _start_smart_reconnect(self):
+        if self.offline_mode or not self.username or not self._last_password:
+            return
+        if not self._reconnect_timer.isActive():
+            self._reconnect_attempts = 0
+            self._reconnect_timer.start()
+
+    def _stop_reconnect_timer(self):
+        if self._reconnect_timer.isActive():
+            self._reconnect_timer.stop()
+
+    def _attempt_smart_reconnect(self):
+        if self.offline_mode or self.authenticated or not self._last_password:
+            self._stop_reconnect_timer()
+            return
+        self._reconnect_attempts += 1
+        self.server_status_label.setText(f"reconnecting... attempt {self._reconnect_attempts}")
+        try:
+            self.connect_and_auth(self._last_auth_mode, self.username, self._last_password, silent=True)
+        except Exception:
+            pass
 
     def _handle_network_line(self, raw):
         self.incoming_queue.put(raw)
@@ -1516,6 +1734,8 @@ class FullDiscordClone(QMainWindow):
                 self.account_id = parts[1]
                 self.username = parts[2]
                 self.authenticated = True
+                self.offline_mode = False
+                self._stop_reconnect_timer()
                 # The server sends a burst of history immediately after AUTH_OK.
                 # Defer all expensive chat widget rebuilding and disk writes until
                 # READY so the Qt GUI remains responsive during login.
@@ -1535,8 +1755,11 @@ class FullDiscordClone(QMainWindow):
 
         if raw.startswith("AUTH_FAIL:"):
             reason = raw.split(":", 1)[1]
+            self._stop_reconnect_timer()
             if self.auth_dialog:
                 self.auth_dialog.status.setText(reason)
+            elif not self.offline_mode:
+                self.chat_status_label.setText(f"reconnect stopped // {reason}")
             return
 
         if raw.startswith("RENAME_OK:"):
@@ -1600,6 +1823,113 @@ class FullDiscordClone(QMainWindow):
             self._refresh_member_list()
             return
 
+        if raw.startswith("HISTORY:"):
+            try:
+                payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+                msg = self.store_message(
+                    payload.get("room", "general-chat"),
+                    payload.get("sender", "?"),
+                    payload.get("text", ""),
+                    local=False,
+                    message_id=payload.get("id"),
+                    reply_to=payload.get("reply_to"),
+                    reactions=payload.get("reactions") or {},
+                    kind=payload.get("kind", "message"),
+                    file_meta=payload.get("file"),
+                    poll=payload.get("poll"),
+                )
+                if payload.get("file"):
+                    self._register_file_metadata(payload.get("file"), msg)
+            except Exception:
+                pass
+            return
+
+        if raw.startswith("MESSAGE:"):
+            try:
+                payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+                msg = self.store_message(
+                    payload.get("room", "general-chat"),
+                    payload.get("sender", "?"),
+                    payload.get("text", ""),
+                    local=False,
+                    message_id=payload.get("id"),
+                    reply_to=payload.get("reply_to"),
+                    reactions=payload.get("reactions") or {},
+                    kind=payload.get("kind", "message"),
+                    file_meta=payload.get("file"),
+                    poll=payload.get("poll"),
+                )
+                if payload.get("file"):
+                    self._register_file_metadata(payload.get("file"), msg)
+                if payload.get("sender") != my_name:
+                    self.play_ping_sound()
+            except Exception:
+                pass
+            return
+
+        if raw.startswith("FILE_OFFER:"):
+            self._handle_file_offer(raw)
+            return
+
+        if raw.startswith("FILE_REQUEST:"):
+            self._handle_file_request(raw)
+            return
+
+        if raw.startswith("FILE_CHUNK:"):
+            self._handle_file_chunk(raw)
+            return
+
+        if raw.startswith("FILE_DONE:"):
+            self._handle_file_done(raw)
+            return
+
+        if raw.startswith("POLL:"):
+            self._handle_poll_event(raw)
+            return
+
+        if raw.startswith("POLL_VOTE:"):
+            self._handle_poll_vote(raw)
+            return
+
+        if raw.startswith("REACTION:"):
+            try:
+                payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+                room = payload.get("room", "general-chat")
+                mid = payload.get("message_id")
+                emoji = payload.get("emoji", "")
+                user = payload.get("user", "")
+                for msg in self.chat_history.get(room, []):
+                    if msg.get("id") == mid:
+                        reactions = msg.setdefault("reactions", {})
+                        users = reactions.setdefault(emoji, [])
+                        active = bool(payload.get("active", True))
+                        if active:
+                            if user and user not in users:
+                                users.append(user)
+                        else:
+                            if user in users:
+                                users.remove(user)
+                            if not users:
+                                reactions.pop(emoji, None)
+                        self._update_message_card(mid, reactions)
+                        self._chat_cache_dirty = True
+                        break
+            except Exception:
+                pass
+            return
+
+        if raw.startswith("MESSAGE_DELETED:"):
+            try:
+                payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+                room = payload.get("room", "general-chat")
+                mid = payload.get("message_id")
+                self.chat_history[room] = [m for m in self.chat_history.get(room, []) if m.get("id") != mid]
+                self._remove_message_card(mid)
+                self._chat_cache_dirty = True
+            except Exception:
+                pass
+            return
+
         if raw.startswith("HIST_CHANNEL:"):
             p = raw.split(":", 3)
             if len(p) == 4:
@@ -1649,6 +1979,9 @@ class FullDiscordClone(QMainWindow):
                 self._chat_cache_dirty = False
             self._refresh_dm_list()
             self.reload_current_chat_view()
+            self._flush_outbox()
+            self.server_status_label.setText("connected")
+            self.chat_status_label.setText("connected")
             return
 
         if raw.startswith("PFP:"):
@@ -1714,7 +2047,7 @@ class FullDiscordClone(QMainWindow):
                 self.reload_current_chat_view()
             return
 
-    def _network_send(self, text):
+    def _network_send(self, text, queue_offline=True):
         if self.client_socket and self.authenticated:
             try:
                 payload = (text + "\n").encode("utf-8")
@@ -1722,56 +2055,431 @@ class FullDiscordClone(QMainWindow):
                     self.client_socket.sendall(payload)
                 return True
             except Exception as exc:
-                self.show_error(f"Network error: {exc}")
+                self._network_disconnected()
+                if queue_offline:
+                    self._outbox.append(text)
+                self.chat_status_label.setText(f"send queued // {type(exc).__name__}")
+                return False
+        if queue_offline:
+            self._outbox.append(text)
         return False
+
+    def _flush_outbox(self):
+        if not (self.client_socket and self.authenticated) or not self._outbox:
+            return
+        pending = list(self._outbox)
+        self._outbox.clear()
+        for payload in pending:
+            if not self._network_send(payload, queue_offline=False):
+                self._outbox.append(payload)
+                break
+
 
     # ---------- chat / members ----------
 
-    def store_message(self, room, sender, text, local=False):
+    def store_message(self, room, sender, text, local=False, message_id=None, reply_to=None, reactions=None, kind="message", file_meta=None, poll=None):
         room = room or "general-chat"
         self.chat_history.setdefault(room, [])
-        key = (room, sender, text)
-        if local:
-            self.pending_local_messages.add(key)
-        elif sender == self.username and key in self.pending_local_messages:
-            # The server echo is already rendered locally. Do not rebuild the
-            # entire chat view a second time just because the echo arrived.
-            self.pending_local_messages.discard(key)
-            return
+        message_id = message_id or uuid.uuid4().hex
+        reactions = reactions or {}
 
-        message = {"sender": sender, "text": text, "id": f"{time.time_ns()}"}
+        existing = next((m for m in self.chat_history[room] if m.get("id") == message_id), None)
+        if existing is not None:
+            existing.update({"sender": sender, "text": text, "reply_to": reply_to, "reactions": reactions, "kind": kind})
+            if file_meta is not None:
+                existing["file"] = file_meta
+            if poll is not None:
+                existing["poll"] = poll
+            if local:
+                self.pending_local_message_ids.add(message_id)
+            else:
+                self.pending_local_message_ids.discard(message_id)
+            if room == self.current_target and not self.loading_history:
+                self._update_message_card(existing.get("id"), existing)
+            return existing
+
+        message = {
+            "sender": sender,
+            "text": text,
+            "id": message_id,
+            "reply_to": reply_to,
+            "reactions": reactions,
+            "kind": kind,
+        }
+        if file_meta is not None:
+            message["file"] = file_meta
+        if poll is not None:
+            message["poll"] = poll
         self.chat_history[room].append(message)
         self.chat_history[room] = self.chat_history[room][-500:]
         self._chat_cache_dirty = True
 
-        # During post-login history replay, don't write JSON or touch the GUI
-        # once per packet. READY performs the single final history render.
+        if local:
+            self.pending_local_message_ids.add(message_id)
+        elif sender == self.username and message_id in self.pending_local_message_ids:
+            self.pending_local_message_ids.discard(message_id)
+            return message
+
         if self.loading_history:
-            return
+            return message
 
         self._save_chat_cache()
         self._chat_cache_dirty = False
-
-        # Live messages are appended in-place. Rebuilding the whole 500-message
-        # view here causes the scrollbar to jump to the top, then back to the
-        # bottom, especially when our own message is echoed by the server.
         if room == self.current_target:
             self._append_message_widget(message, scroll_to_bottom=True)
+        return message
 
     def send_message(self):
         text = self.message_entry.text().strip()
-        if not text or not self.authenticated:
+        if not text:
+            return
+        if not self.authenticated and not self.offline_mode:
+            self.show_error("Not connected. Use CONTINUE OFFLINE or wait for reconnect.")
             return
         room = self.current_target
-        self.store_message(room, self.username, text, local=True)
+        message_id = uuid.uuid4().hex
+        reply_to = dict(self.reply_target) if self.reply_target else None
+        self.store_message(room, self.username, text, local=True, message_id=message_id, reply_to=reply_to)
         self.message_entry.clear()
-        if room in self.server_channels:
-            if room == "general-chat":
-                self._network_send(f"GLOBAL:{text}")
-            else:
-                self._network_send(f"CHANNEL:{room}:{text}")
+        payload = {
+            "room": room,
+            "id": message_id,
+            "text": text,
+            "reply_to": reply_to,
+        }
+        encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self._network_send(f"MESSAGE:{encoded}")
+        if self.offline_mode:
+            self.chat_status_label.setText("offline draft // will send on reconnect")
+        self._clear_reply_target()
+
+    def _register_file_metadata(self, meta, message=None):
+        if not isinstance(meta, dict) or not meta.get("file_id"):
+            return
+        if meta.get("sender") == self.username:
+            self._pending_file_sends[meta["file_id"]] = meta
         else:
-            self._network_send(f"DM:{room}:{text}")
+            self._incoming_file_transfers[meta["file_id"]] = meta
+        if message is not None and message.get("id"):
+            meta.setdefault("message_id", message.get("id"))
+
+    def _file_digest(self, path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def choose_file_to_send(self):
+        if not self.username:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Select file to send")
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+            if size > MAX_FILE_SIZE:
+                self.show_error(f"File is too large. NETRA currently supports up to {format_file_size(MAX_FILE_SIZE)}.")
+                return
+            file_id = uuid.uuid4().hex
+            filename = os.path.basename(path)
+            mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            digest = self._file_digest(path)
+            cache_path = local_file_path(file_id, filename)
+            with open(path, "rb") as src, open(cache_path, "wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            meta = {
+                "file_id": file_id, "name": filename, "size": size, "mime": mime,
+                "sha256": digest, "sender": self.username, "room": self.current_target,
+            }
+            payload = {"room": self.current_target, "id": uuid.uuid4().hex, "text": "", "file": meta, "kind": "file", "reply_to": dict(self.reply_target) if self.reply_target else None}
+            meta["message_id"] = payload["id"]
+            self._pending_file_sends[file_id] = meta
+            self.store_message(self.current_target, self.username, "", local=True, message_id=payload["id"], reply_to=payload["reply_to"], kind="file", file_meta=meta)
+            encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode("ascii")
+            self._network_send(f"MESSAGE:{encoded}")
+            self._clear_reply_target()
+        except Exception as exc:
+            self.show_error(f"Could not prepare file:\n{type(exc).__name__}: {exc}")
+
+    def _handle_file_offer(self, raw):
+        try:
+            payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+            self._incoming_file_transfers[payload["file_id"]] = payload
+            self.chat_status_label.setText(f"file available // {payload.get('name', 'file')}")
+            # Attach to the matching cached message without forcing a full rebuild.
+            room = payload.get("room", self.current_target)
+            for msg in self.chat_history.get(room, []):
+                if msg.get("id") == payload.get("message_id"):
+                    msg["file"] = payload
+                    self._update_message_card(msg.get("id"), msg)
+                    break
+        except Exception as exc:
+            self.chat_status_label.setText(f"file offer error // {exc}")
+
+    def _download_file(self, file_meta):
+        if not file_meta:
+            return
+        file_id = file_meta.get("file_id")
+        local = local_file_path(file_id, file_meta.get("name", "file"))
+        if os.path.exists(local) and os.path.getsize(local) == int(file_meta.get("size", -1)):
+            self._open_local_file(local, file_meta)
+            return
+        request = {"room": self.current_target, "file_id": file_id, "sender": file_meta.get("sender", "")}
+        encoded = base64.b64encode(json.dumps(request, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self._network_send(f"FILE_REQUEST:{encoded}")
+        self.chat_status_label.setText(f"downloading // {file_meta.get('name', 'file')}")
+
+    def _open_local_file(self, path, meta=None):
+        try:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        except Exception as exc:
+            self.show_error(f"Could not open file: {exc}")
+
+    def _handle_file_request(self, raw):
+        try:
+            payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+            file_id = payload.get("file_id", "")
+            pending = self._pending_file_sends.get(file_id)
+            if not pending:
+                return
+            threading.Thread(target=self._send_file_chunks, args=(pending,), daemon=True).start()
+        except Exception:
+            pass
+
+    def _send_file_chunks(self, meta):
+        path = local_file_path(meta["file_id"], meta.get("name", "file"))
+        try:
+            with self._file_send_lock, open(path, "rb") as handle:
+                index = 0
+                while True:
+                    chunk = handle.read(FILE_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    packet = {"file_id": meta["file_id"], "index": index, "data": base64.b64encode(chunk).decode("ascii")}
+                    encoded = base64.b64encode(json.dumps(packet, separators=(",", ":")).encode("utf-8")).decode("ascii")
+                    self._network_send(f"FILE_CHUNK:{encoded}", queue_offline=False)
+                    index += 1
+            done = base64.b64encode(json.dumps({"file_id": meta["file_id"], "sha256": meta.get("sha256", "")}, separators=(",", ":")).encode("utf-8")).decode("ascii")
+            self._network_send(f"FILE_DONE:{done}", queue_offline=False)
+        except Exception as exc:
+            self.chat_status_label.setText(f"file send failed // {exc}")
+
+    def _handle_file_chunk(self, raw):
+        try:
+            packet = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+            fid = packet["file_id"]
+            meta = self._incoming_file_transfers.get(fid)
+            if not meta:
+                return
+            state = getattr(self, "_file_receive_state", {}).get(fid) if hasattr(self, "_file_receive_state") else None
+            if state is None:
+                if not hasattr(self, "_file_receive_state"):
+                    self._file_receive_state = {}
+                path = local_file_path(fid, meta.get("name", "file")) + ".part"
+                state = {"path": path, "next": 0}
+                self._file_receive_state[fid] = state
+            if int(packet.get("index", -1)) != state["next"]:
+                return
+            with open(state["path"], "ab") as handle:
+                handle.write(base64.b64decode(packet["data"]))
+            state["next"] += 1
+        except Exception:
+            pass
+
+    def _handle_file_done(self, raw):
+        try:
+            payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+            fid = payload["file_id"]
+            meta = self._incoming_file_transfers.get(fid)
+            state = getattr(self, "_file_receive_state", {}).pop(fid, None)
+            if not meta or not state:
+                return
+            target = local_file_path(fid, meta.get("name", "file"))
+            digest = self._file_digest(state["path"])
+            if payload.get("sha256") and digest != payload["sha256"]:
+                os.remove(state["path"])
+                self.show_error("Downloaded file failed checksum verification.")
+                return
+            os.replace(state["path"], target)
+            self.chat_status_label.setText(f"download complete // {meta.get('name', 'file')}")
+            self._open_local_file(target, meta)
+            self.reload_current_chat_view()
+        except Exception as exc:
+            self.show_error(f"File download failed: {exc}")
+
+    def create_poll(self):
+        if not self.authenticated and not self.offline_mode:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // CREATE POLL")
+        dialog.setFixedSize(440, 330)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        question = QLineEdit()
+        question.setPlaceholderText("Question")
+        layout.addWidget(question)
+        options = []
+        for i in range(4):
+            line = QLineEdit()
+            line.setPlaceholderText(f"Option {i + 1}")
+            layout.addWidget(line)
+            options.append(line)
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        opts = [w.text().strip() for w in options if w.text().strip()]
+        q = question.text().strip()
+        if not q or len(opts) < 2:
+            self.show_error("A poll needs a question and at least two options.")
+            return
+        poll = {"question": q[:240], "options": opts[:6], "votes": {str(i): [] for i in range(min(6, len(opts)))}}
+        message_id = uuid.uuid4().hex
+        payload = {"room": self.current_target, "id": message_id, "text": q, "kind": "poll", "poll": poll, "reply_to": dict(self.reply_target) if self.reply_target else None}
+        self.store_message(self.current_target, self.username, q, local=True, message_id=message_id, reply_to=payload["reply_to"], kind="poll", poll=poll)
+        encoded = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self._network_send(f"POLL_CREATE:{encoded}")
+        self._clear_reply_target()
+
+    def _handle_poll_event(self, raw):
+        try:
+            payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+            self.store_message(payload.get("room", self.current_target), payload.get("sender", "?"), payload.get("text", ""), message_id=payload.get("id"), reply_to=payload.get("reply_to"), reactions=payload.get("reactions") or {}, kind="poll", poll=payload.get("poll") or {})
+        except Exception:
+            pass
+
+    def _handle_poll_vote(self, raw):
+        try:
+            payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+            room = payload.get("room", self.current_target)
+            for msg in self.chat_history.get(room, []):
+                if msg.get("id") == payload.get("message_id"):
+                    msg["poll"] = payload.get("poll") or msg.get("poll")
+                    break
+            self._chat_cache_dirty = True
+            self._save_chat_cache()
+            if room == self.current_target:
+                self.reload_current_chat_view()
+        except Exception:
+            pass
+
+    def _set_reply_target(self, message):
+        if not message:
+            return
+        self.reply_target = {
+            "id": message.get("id", ""),
+            "sender": message.get("sender", "?"),
+            "text": message.get("text", "")[:180],
+        }
+        self.reply_banner_label.setText(f"REPLYING TO {message.get('sender', '?')}: {message.get('text', '')[:160]}")
+        self.reply_banner.setVisible(True)
+        self.message_entry.setFocus()
+
+    def _clear_reply_target(self):
+        self.reply_target = None
+        if hasattr(self, "reply_banner"):
+            self.reply_banner.setVisible(False)
+            self.reply_banner_label.clear()
+
+    def _react_to_message(self, message):
+        if not message or not self.authenticated:
+            return
+        menu = QMenu(self)
+        reactions = [
+            ("LIKE", "👍"), ("HEART", "❤️"), ("LAUGH", "😂"), ("WOW", "😮"),
+            ("SAD", "😢"), ("FIRE", "🔥"), ("PARTY", "🎉"), ("EYES", "👀"),
+        ]
+        for label, emoji in reactions:
+            action = menu.addAction(label)
+            action.triggered.connect(lambda checked=False, m=message, e=emoji: self._send_reaction(m, e))
+        menu.exec(QCursor.pos())
+
+    def _send_reaction(self, message, emoji):
+        room = self.current_target
+        mid = message.get("id")
+        if not mid:
+            return
+        encoded = base64.b64encode(json.dumps({
+            "room": room, "message_id": mid, "emoji": emoji
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self._network_send(f"REACT:{encoded}")
+
+    def _delete_message(self, message):
+        if not message or message.get("sender") != self.username:
+            return
+        encoded = base64.b64encode(json.dumps({
+            "room": self.current_target, "message_id": message.get("id", "")
+        }, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self._network_send(f"DELETE:{encoded}")
+
+    def _add_file_embed(self, body, msg):
+        meta = msg.get("file") or {}
+        file_id = meta.get("file_id", "")
+        name = meta.get("name", "file")
+        size = format_file_size(meta.get("size", 0))
+        mime = meta.get("mime", "application/octet-stream")
+        box = QFrame(objectName="panelAlt")
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(8, 8, 8, 8)
+        label = QLabel(f"FILE  {name}  //  {size}")
+        label.setProperty("role", "messageText")
+        box_layout.addWidget(label)
+        local = local_file_path(file_id, name)
+        if mime.startswith("image/") and os.path.exists(local):
+            thumb = QLabel()
+            pix = QPixmap(local)
+            if not pix.isNull():
+                thumb.setPixmap(pix.scaled(360, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                box_layout.addWidget(thumb)
+        open_btn = QPushButton("OPEN LOCAL" if os.path.exists(local) else "DOWNLOAD")
+        if os.path.exists(local):
+            open_btn.clicked.connect(lambda _=False, path=local, m=meta: self._open_local_file(path, m))
+        else:
+            open_btn.clicked.connect(lambda _=False, m=meta: self._download_file(m))
+        box_layout.addWidget(open_btn, alignment=Qt.AlignLeft)
+        body.addWidget(box)
+
+    def _vote_poll(self, message, option_index):
+        if not message or not message.get("id"):
+            return
+        payload = {"room": self.current_target, "message_id": message.get("id"), "option": int(option_index)}
+        encoded = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self._network_send(f"POLL_VOTE:{encoded}")
+
+    def _update_message_card(self, message_id, message_or_reactions):
+        card = self.message_card_widgets.get(message_id)
+        if card is None:
+            return
+        if hasattr(message_or_reactions, "get") and "reactions" in message_or_reactions:
+            reactions = message_or_reactions.get("reactions") or {}
+        else:
+            reactions = message_or_reactions or {}
+        parts = []
+        for emoji, users in reactions.items():
+            count = len(users if isinstance(users, list) else [])
+            if count:
+                parts.append(f"{emoji} {count}")
+        card.reaction_label.setText("   ".join(parts))
+        card.reaction_label.setVisible(bool(parts))
+
+    def _remove_message_card(self, message_id):
+        card = self.message_card_widgets.pop(message_id, None)
+        if card is not None:
+            card.setParent(None)
+            card.deleteLater()
+        self._save_chat_cache()
 
     def select_channel(self, channel):
         self.current_target = channel
@@ -1847,7 +2555,7 @@ class FullDiscordClone(QMainWindow):
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(0)
-        name = QLabel(("🔊 " if voice else "") + user + ("  [YOU]" if user == self.username else ""))
+        name = QLabel(user + ("  [YOU]" if user == self.username else ""))
         name.setProperty("role", "memberName")
         text_col.addWidget(name)
         if status:
@@ -1894,6 +2602,7 @@ class FullDiscordClone(QMainWindow):
         self._render_generation += 1
         generation = self._render_generation
 
+        self.message_card_widgets.clear()
         while self.chat_content_layout.count():
             item = self.chat_content_layout.takeAt(0)
             widget = item.widget()
@@ -1912,13 +2621,14 @@ class FullDiscordClone(QMainWindow):
         self._render_messages_in_batches(generation)
 
     def _append_message_widget(self, msg, scroll_to_bottom=False):
-        """Append one live message without rebuilding the existing chat widgets."""
         c = self.palette_colors()
         sender = msg.get("sender", "?")
         text = msg.get("text", "")
         edited = "  [edited]" if msg.get("edited") else ""
 
-        card = QFrame(objectName="messageCard")
+        card = HoverMessageCard()
+        card.message_id = msg.get("id")
+        card.message_data = msg
         layout = QHBoxLayout(card)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(8)
@@ -1931,30 +2641,86 @@ class FullDiscordClone(QMainWindow):
         layout.addWidget(avatar, alignment=Qt.AlignTop)
 
         body = QVBoxLayout()
-        body.setSpacing(1)
+        body.setSpacing(2)
+        head = QHBoxLayout()
+        head.setSpacing(4)
         name = QLabel(sender + edited)
-        name.setStyleSheet(
-            f"color:{c['bright']}; font-family:Consolas; font-size:12px; font-weight:700;"
-        )
-        body.addWidget(name)
+        name.setStyleSheet(f"color:{c['bright']}; font-family:Consolas; font-size:12px; font-weight:700;")
+        head.addWidget(name)
+        head.addStretch(1)
 
-        msg_label = QLabel(text)
-        msg_label.setWordWrap(True)
-        msg_label.setStyleSheet(
-            f"color:{c['dim']}; font-family:Consolas; font-size:13px;"
-        )
-        body.addWidget(msg_label)
+        actions = QWidget()
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(3)
+        reply_btn = QPushButton("REPLY")
+        reply_btn.setObjectName("messageActionButton")
+        reply_btn.clicked.connect(lambda _=False, m=msg: self._set_reply_target(m))
+        actions_layout.addWidget(reply_btn)
+        react_btn = QPushButton("REACT")
+        react_btn.setObjectName("messageActionButton")
+        react_btn.clicked.connect(lambda _=False, m=msg: self._react_to_message(m))
+        actions_layout.addWidget(react_btn)
+        if sender == self.username:
+            delete_btn = QPushButton("DELETE")
+            delete_btn.setObjectName("messageActionButton")
+            delete_btn.clicked.connect(lambda _=False, m=msg: self._delete_message(m))
+            actions_layout.addWidget(delete_btn)
+        actions.setVisible(False)
+        head.addWidget(actions)
+        body.addLayout(head)
+
+        reply_to = msg.get("reply_to") or {}
+        if reply_to:
+            preview = QLabel(f"↪ {reply_to.get('sender', '?')}: {reply_to.get('text', '')[:160]}")
+            preview.setProperty("role", "replyPreview")
+            preview.setWordWrap(True)
+            body.addWidget(preview)
+
+        if msg.get("kind") == "poll" and msg.get("poll"):
+            poll = msg.get("poll") or {}
+            question = QLabel(str(poll.get("question", text)))
+            question.setProperty("role", "messageText")
+            question.setWordWrap(True)
+            body.addWidget(question)
+            votes = poll.setdefault("votes", {})
+            for idx, option in enumerate(poll.get("options", [])):
+                row = QHBoxLayout()
+                vote_btn = QPushButton(str(option))
+                vote_btn.clicked.connect(lambda _=False, m=msg, i=idx: self._vote_poll(m, i))
+                count = QLabel(str(len(votes.get(str(idx), []))))
+                count.setProperty("role", "muted")
+                row.addWidget(vote_btn, 1)
+                row.addWidget(count)
+                body.addLayout(row)
+        elif msg.get("kind") == "file" and msg.get("file"):
+            self._add_file_embed(body, msg)
+        else:
+            msg_label = QLabel(text)
+            msg_label.setProperty("role", "messageText")
+            msg_label.setWordWrap(True)
+            body.addWidget(msg_label)
+
+        reaction_text = []
+        for emoji, users in (msg.get("reactions") or {}).items():
+            if isinstance(users, list) and users:
+                reaction_text.append(f"{emoji} {len(users)}")
+        reaction_label = QLabel("   ".join(reaction_text))
+        reaction_label.setProperty("role", "reactionRow")
+        reaction_label.setVisible(bool(reaction_text))
+        card.reaction_label = reaction_label
+        body.addWidget(reaction_label)
+
         layout.addLayout(body, 1)
+        card.hovered.connect(actions.setVisible)
         self.chat_content_layout.addWidget(card)
+        if msg.get("id"):
+            self.message_card_widgets[msg.get("id")] = card
 
         if scroll_to_bottom:
-            # Ask the scroll area to follow the bottom. QScrollArea can emit
-            # rangeChanged more than once while Qt recalculates child heights,
-            # so the actual scroll is performed from _on_chat_scroll_range_changed
-            # and again after the layout has settled.
             self._chat_wants_bottom = True
             QTimer.singleShot(0, self._scroll_chat_to_bottom)
-            QTimer.singleShot(20, self._scroll_chat_to_bottom)
+            QTimer.singleShot(25, self._scroll_chat_to_bottom)
 
     def _on_chat_scroll_range_changed(self, _minimum, _maximum):
         if getattr(self, "_chat_wants_bottom", False):
@@ -2055,7 +2821,7 @@ class FullDiscordClone(QMainWindow):
     # ---------- Voice 2.0 ----------
 
     def _voice_rate(self):
-        return {"Low": 12000, "Balanced": 16000, "High": 24000, "Ultra": 32000}.get(self.voice_quality, VOICE_RATE_DEFAULT)
+        return {"Low": 16000, "Balanced": 24000, "High": 32000, "Ultra": 48000}.get(self.voice_quality, VOICE_RATE_DEFAULT)
 
     def _process_mic_pcm(self, pcm):
         import array
@@ -2120,6 +2886,7 @@ class FullDiscordClone(QMainWindow):
 
             self.voice_input_rate = int(round(float(in_info.get("default_samplerate") or 48000)))
             self.voice_output_rate = int(round(float(out_info.get("default_samplerate") or 48000)))
+            self.voice_send_resampler = StreamingPCMResampler(self.voice_input_rate, self._voice_rate())
             sd.check_input_settings(device=in_device, samplerate=self.voice_input_rate, channels=VOICE_CHANNELS, dtype="int16")
             sd.check_output_settings(device=out_device, samplerate=self.voice_output_rate, channels=VOICE_CHANNELS, dtype="int16")
 
@@ -2137,7 +2904,7 @@ class FullDiscordClone(QMainWindow):
                 dtype="int16",
                 channels=VOICE_CHANNELS,
                 device=out_device,
-                latency="low",
+                latency="high",
             )
             self.voice_input_stream.start()
             self.voice_output_stream.start()
@@ -2149,8 +2916,9 @@ class FullDiscordClone(QMainWindow):
             self.voice_packet_count = 0
             self.voice_bytes_received = 0
             self.voice_jitter_ms = 0.0
+            self.voice_resamplers.clear()
             self.in_voice_chat = True
-            self.voice_button.setText("🎤 Leave Voice")
+            self.voice_button.setText("LEAVE VOICE")
             self._network_send("VOICEJOIN:1")
             threading.Thread(target=self.voice_send_loop, daemon=True).start()
             threading.Thread(target=self.voice_playback_loop, daemon=True).start()
@@ -2170,7 +2938,15 @@ class FullDiscordClone(QMainWindow):
                     pcm = b"\x00" * len(pcm)
                 pcm = self._process_mic_pcm(pcm)
                 network_rate = self._voice_rate()
-                network_data = resample_pcm16_mono(pcm, self.voice_input_rate, network_rate)
+                if (
+                    self.voice_send_resampler is None
+                    or self.voice_send_resampler.src_rate != int(self.voice_input_rate)
+                    or self.voice_send_resampler.dst_rate != int(network_rate)
+                ):
+                    self.voice_send_resampler = StreamingPCMResampler(self.voice_input_rate, network_rate)
+                network_data = self.voice_send_resampler.process(pcm)
+                if not network_data:
+                    continue
                 encoded = base64.b64encode(network_data).decode("ascii")
                 if self.client_socket and self.authenticated:
                     payload = f"VOICE:{network_rate}:{encoded}\n".encode("ascii")
@@ -2182,6 +2958,7 @@ class FullDiscordClone(QMainWindow):
                 break
 
     def voice_playback_loop(self):
+        prebuffer = []
         while self.in_voice_chat and self.voice_output_stream:
             try:
                 sender, sender_rate, data = self.voice_play_queue.get(timeout=0.4)
@@ -2197,22 +2974,39 @@ class FullDiscordClone(QMainWindow):
                 self.voice_bytes_received += len(data)
                 if self.voice_deafened or self.voice_user_mutes.get(sender, False):
                     continue
-                gain = self.voice_volume * float(self.voice_user_volumes.get(sender, 1.0))
-                playback = resample_pcm16_mono(data, sender_rate, self.voice_output_rate)
-                playback = self._apply_voice_gain(playback, gain)
-                self.voice_output_stream.write(playback)
-                self.voice_activity[sender] = now
-                if self.voice_record_wave:
-                    self.voice_record_wave.writeframes(playback)
+                prebuffer.append((sender, sender_rate, data))
+                if len(prebuffer) < self.voice_prebuffer_packets and self.voice_play_queue.qsize() < 2:
+                    continue
+                buffered = prebuffer
+                prebuffer = []
+                for buffered_sender, buffered_rate, buffered_data in buffered:
+                    self._play_voice_packet(buffered_sender, buffered_rate, buffered_data)
             except Exception as exc:
                 if self.in_voice_chat:
-                    QTimer.singleShot(0, lambda e=str(exc): self.show_error(f"Voice playback stopped:\n{type(exc).__name__}: {e}"))
                     self.in_voice_chat = False
+                    QTimer.singleShot(0, lambda e=str(exc): self.show_error(f"Voice playback stopped:\n{type(exc).__name__}: {e}"))
                 break
+
+    def _play_voice_packet(self, sender, sender_rate, data):
+        if self.voice_deafened or self.voice_user_mutes.get(sender, False):
+            return
+        state = self.voice_resamplers.get(sender)
+        if state is None or state.src_rate != int(sender_rate) or state.dst_rate != int(self.voice_output_rate):
+            state = StreamingPCMResampler(int(sender_rate), int(self.voice_output_rate))
+            self.voice_resamplers[sender] = state
+        playback = state.process(data)
+        if not playback:
+            return
+        gain = self.voice_volume * float(self.voice_user_volumes.get(sender, 1.0))
+        playback = self._apply_voice_gain(playback, gain)
+        self.voice_output_stream.write(playback)
+        self.voice_activity[sender] = time.monotonic()
+        if self.voice_record_wave:
+            self.voice_record_wave.writeframes(playback)
 
     def toggle_voice_mute(self):
         self.voice_muted = not self.voice_muted
-        self.voice_mute_button.setText("🎤 Unmute Mic" if self.voice_muted else "🔇 Mute Mic")
+        self.voice_mute_button.setText("UNMUTE MIC" if self.voice_muted else "MUTE MIC")
 
     def stop_voice_chat(self):
         was_active = self.in_voice_chat
@@ -2228,18 +3022,52 @@ class FullDiscordClone(QMainWindow):
                 pass
         self.voice_input_stream = None
         self.voice_output_stream = None
-        self.voice_button.setText("🎤 Join Voice")
+        self.voice_resamplers.clear()
+        self.voice_send_resampler = None
+        self.voice_button.setText("JOIN VOICE")
         self.chat_status_label.setText("connected" if self.authenticated else "offline")
 
     def _update_voice_stats(self):
         if self.in_voice_chat:
+            jitter = self.voice_jitter_ms
+            quality = "EXCELLENT" if jitter < 4 else "GOOD" if jitter < 9 else "UNSTABLE" if jitter < 18 else "POOR"
             self.voice_stats_label.setText(
-                f"packets {self.voice_packet_count}  bytes {self.voice_bytes_received}  jitter {self.voice_jitter_ms:.1f}ms"
+                f"packets {self.voice_packet_count}  bytes {self.voice_bytes_received}  jitter {jitter:.1f}ms  quality {quality}"
             )
         elif hasattr(self, "voice_stats_label"):
             self.voice_stats_label.setText("voice offline")
 
+        if hasattr(self, "voice_radar_label"):
+            now = time.monotonic()
+            active = []
+            for user in self.voice_users:
+                if user == self.username:
+                    label = "YOU"
+                    active.append(label)
+                else:
+                    age = now - float(self.voice_activity.get(user, 0.0))
+                    label = user
+                    if age < 0.65:
+                        label = f"> {user} <"
+                        active.append(label)
+            if active:
+                self.voice_radar_label.setText("VOICE RADAR\n" + "  ".join(active))
+            elif self.voice_users:
+                self.voice_radar_label.setText("VOICE RADAR\nno active speakers")
+            else:
+                self.voice_radar_label.setText("VOICE RADAR\nno one connected")
+
     # ---------- misc ----------
+
+    def _set_user_volume(self, user, value):
+        self.voice_user_volumes[user] = max(0.0, min(2.0, float(value) / 100.0))
+        self.settings["voice_user_volumes"] = dict(self.voice_user_volumes)
+        save_settings(self.settings)
+
+    def _set_user_mute(self, user, state):
+        self.voice_user_mutes[user] = bool(state)
+        self.settings["voice_user_mutes"] = dict(self.voice_user_mutes)
+        save_settings(self.settings)
 
     def _refresh_voice_user_settings(self):
         """Refresh the per-user voice controls shown in Settings."""

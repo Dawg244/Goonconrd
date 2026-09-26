@@ -28,6 +28,10 @@ client_send_locks = {}     # socket -> Lock, prevents line interleaving on share
 clients_lock = threading.RLock()
 voice_users = set()
 voice_lock = threading.RLock()
+file_catalog = {}       # file_id -> metadata, never persisted
+file_routes = {}        # file_id -> set of requesting usernames
+file_lock = threading.RLock()
+MAX_FILE_SIZE = 50 * 1024 * 1024
 chat_log = {"general-chat": [], "random": [], "dms": {}}
 chat_lock = threading.RLock()
 
@@ -60,8 +64,29 @@ def load():
     for channel in TEXT_CHANNELS:
         if not isinstance(chat_log.get(channel), list):
             chat_log[channel] = []
+        chat_log[channel] = [normalize_message(e) for e in chat_log[channel]][-MAX_HISTORY:]
     if not isinstance(chat_log.get("dms"), dict):
         chat_log["dms"] = {}
+    for key, entries in list(chat_log["dms"].items()):
+        if not isinstance(entries, list):
+            chat_log["dms"][key] = []
+        else:
+            chat_log["dms"][key] = [normalize_message(e) for e in entries][-MAX_HISTORY:]
+
+    # Rebuild in-memory file metadata from message history. The actual files are
+    # never stored on the server; only metadata is retained in chat history.
+    with file_lock:
+        file_catalog.clear()
+        for channel in TEXT_CHANNELS:
+            for entry in chat_log.get(channel, []):
+                meta = entry.get("file") if isinstance(entry, dict) else None
+                if isinstance(meta, dict) and meta.get("file_id"):
+                    file_catalog[meta["file_id"]] = dict(meta)
+        for entries in chat_log.get("dms", {}).values():
+            for entry in entries:
+                meta = entry.get("file") if isinstance(entry, dict) else None
+                if isinstance(meta, dict) and meta.get("file_id"):
+                    file_catalog[meta["file_id"]] = dict(meta)
 
 
 def save_accounts():
@@ -168,6 +193,62 @@ def dm_key(a, b):
     return "|".join(sorted([a, b], key=str.casefold))
 
 
+def event_encode(payload):
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def event_decode(encoded):
+    return json.loads(base64.b64decode(encoded).decode("utf-8"))
+
+
+def normalize_message(entry, sender_fallback=""):
+    if not isinstance(entry, dict):
+        return {"id": uuid.uuid4().hex, "sender": sender_fallback, "text": str(entry), "reply_to": None, "reactions": {}}
+    entry.setdefault("id", uuid.uuid4().hex)
+    entry.setdefault("sender", sender_fallback)
+    entry.setdefault("text", "")
+    entry.setdefault("reply_to", None)
+    reactions = entry.get("reactions")
+    if not isinstance(reactions, dict):
+        reactions = {}
+    cleaned = {}
+    for emoji, users in reactions.items():
+        if isinstance(users, list):
+            cleaned[str(emoji)] = sorted(set(str(u) for u in users))
+    entry["reactions"] = cleaned
+    return entry
+
+
+def find_message(room, message_id, username=None):
+    with chat_lock:
+        if room in TEXT_CHANNELS:
+            entries = chat_log.get(room, [])
+        else:
+            if not username:
+                return None, None
+            key = dm_key(username, room)
+            entries = chat_log.get("dms", {}).get(key, [])
+        for entry in entries:
+            if entry.get("id") == message_id:
+                return entry, entries
+    return None, None
+
+
+def send_private_event(room, username, line):
+    if room in TEXT_CHANNELS:
+        broadcast(line)
+        return
+    with clients_lock:
+        targets = {clients.get(username)}
+        target_conn = clients.get(room)
+        if target_conn is not None:
+            targets.add(target_conn)
+    for conn in targets:
+        if conn is not None:
+            send_line(conn, line)
+
+
 def send_presence_lists():
     with lock:
         all_names = sorted([str(v.get("username", "")) for v in accounts.values() if v.get("username")], key=str.lower)
@@ -189,7 +270,9 @@ def send_history(conn, username):
     with chat_lock:
         for channel in TEXT_CHANNELS:
             for entry in chat_log.get(channel, [])[-MAX_HISTORY:]:
-                send_line(conn, f"HIST_CHANNEL:{channel}:{entry.get('sender','')}:{entry.get('text','')}")
+                payload = dict(normalize_message(entry))
+                payload["room"] = channel
+                send_line(conn, "HISTORY:" + event_encode(payload))
         for key, entries in chat_log.get("dms", {}).items():
             if username not in key.split("|"):
                 continue
@@ -198,7 +281,9 @@ def send_history(conn, username):
                 continue
             partner = parts[0] if parts[1] == username else parts[1]
             for entry in entries[-MAX_HISTORY:]:
-                send_line(conn, f"HIST_DM:{partner}:{entry.get('sender','')}:{entry.get('text','')}")
+                payload = dict(normalize_message(entry))
+                payload["room"] = partner
+                send_line(conn, "HISTORY:" + event_encode(payload))
 
 
 def send_all_pfps(conn):
@@ -236,6 +321,46 @@ def finish_auth(conn, username, aid):
     return username
 
 
+def route_file_chunk(line, sender_username):
+    try:
+        encoded = line.split(":", 1)[1]
+        payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
+        file_id = str(payload.get("file_id", ""))
+        if not file_id:
+            return
+        with file_lock:
+            meta = file_catalog.get(file_id)
+            targets = list(file_routes.get(file_id, set()))
+        if not meta or meta.get("sender") != sender_username:
+            return
+        for target_username in targets:
+            with clients_lock:
+                target = clients.get(target_username)
+            if target is not None:
+                send_line(target, line)
+    except Exception:
+        pass
+
+
+def route_file_done(line, sender_username):
+    try:
+        encoded = line.split(":", 1)[1]
+        payload = json.loads(base64.b64decode(encoded).decode("utf-8"))
+        file_id = str(payload.get("file_id", ""))
+        with file_lock:
+            meta = file_catalog.get(file_id)
+            targets = list(file_routes.pop(file_id, set()))
+        if not meta or meta.get("sender") != sender_username:
+            return
+        for target_username in targets:
+            with clients_lock:
+                target = clients.get(target_username)
+            if target is not None:
+                send_line(target, line)
+    except Exception:
+        pass
+
+
 def handle_line(conn, username, line):
     if line.startswith("LOGIN:") or line.startswith("REGISTER:"):
         parts = line.split(":", 2)
@@ -260,6 +385,44 @@ def handle_line(conn, username, line):
             send_line(conn, directory_response)
         return username
 
+    if line.startswith("FILE_REQUEST:"):
+        try:
+            payload = event_decode(line.split(":", 1)[1])
+            file_id = str(payload.get("file_id", ""))
+            requested_sender = str(payload.get("sender", ""))
+            with file_lock:
+                meta = file_catalog.get(file_id)
+                if not meta:
+                    send_line(conn, "ERROR:That file is no longer available from its sender")
+                    return username
+                if requested_sender and meta.get("sender") != requested_sender:
+                    send_line(conn, "ERROR:File sender mismatch")
+                    return username
+                file_routes.setdefault(file_id, set()).add(username)
+                sender_username = meta.get("sender", "")
+            with clients_lock:
+                sender_conn = clients.get(sender_username)
+            if sender_conn is not None:
+                forward = dict(payload)
+                forward["requester"] = username
+                send_line(sender_conn, "FILE_REQUEST:" + event_encode(forward))
+            else:
+                with file_lock:
+                    file_routes.get(file_id, set()).discard(username)
+                send_line(conn, "ERROR:The sender is offline; the file can be downloaded once they reconnect")
+        except Exception as exc:
+            send_line(conn, "ERROR:Invalid file request")
+            print("[FILE REQUEST ERROR]", username, exc)
+        return username
+
+    if line.startswith("FILE_CHUNK:"):
+        route_file_chunk(line, username)
+        return username
+
+    if line.startswith("FILE_DONE:"):
+        route_file_done(line, username)
+        return username
+
     if line.startswith("VOICE:"):
         # Voice audio travels over the already-authenticated TCP connection.
         # Format from client: VOICE:<base64 PCM>
@@ -282,6 +445,241 @@ def handle_line(conn, username, line):
         for target_name, peer in targets:
             send_line(peer, packet)
         return username
+
+    if line.startswith("MESSAGE:"):
+        try:
+            payload = event_decode(line.split(":", 1)[1])
+            room = str(payload.get("room", "general-chat")).strip()
+            text = str(payload.get("text", ""))[:4000]
+            message_id = str(payload.get("id", "")).strip() or uuid.uuid4().hex
+            reply_to = payload.get("reply_to") if isinstance(payload.get("reply_to"), dict) else None
+            kind = str(payload.get("kind", "message"))
+            file_meta = payload.get("file") if isinstance(payload.get("file"), dict) else None
+            poll = payload.get("poll") if isinstance(payload.get("poll"), dict) else None
+            if file_meta:
+                try:
+                    size = int(file_meta.get("size", 0))
+                except Exception:
+                    size = 0
+                if size <= 0 or size > MAX_FILE_SIZE or not file_meta.get("file_id"):
+                    send_line(conn, "ERROR:Invalid file metadata")
+                    return username
+                file_meta = dict(file_meta)
+                file_meta["sender"] = username
+                file_meta["room"] = room
+                with file_lock:
+                    file_catalog[file_meta["file_id"]] = dict(file_meta)
+            if room in TEXT_CHANNELS:
+                entry = {"id": message_id, "sender": username, "text": text, "reply_to": reply_to, "reactions": {}, "kind": kind}
+                if file_meta:
+                    entry["file"] = file_meta
+                if poll:
+                    entry["poll"] = poll
+                with chat_lock:
+                    if any(e.get("id") == message_id for e in chat_log.setdefault(room, [])):
+                        message_id = uuid.uuid4().hex
+                        entry["id"] = message_id
+                    chat_log[room].append(entry)
+                    chat_log[room] = chat_log[room][-MAX_HISTORY:]
+                    save_chat()
+                event = dict(entry)
+                event["room"] = room
+                broadcast("MESSAGE:" + event_encode(event))
+                return username
+
+            target = room
+            if not target or target.casefold() == username.casefold():
+                return username
+            with lock:
+                target_aid = username_map.get(target.casefold())
+                if not target_aid:
+                    send_line(conn, "ERROR:That user does not exist")
+                    return username
+                target = accounts[target_aid].get("username", target)
+            key = dm_key(username, target)
+            entry = {"id": message_id, "sender": username, "text": text, "reply_to": reply_to, "reactions": {}, "kind": kind}
+            if file_meta:
+                entry["file"] = file_meta
+            if poll:
+                entry["poll"] = poll
+            with chat_lock:
+                entries = chat_log.setdefault("dms", {}).setdefault(key, [])
+                if any(e.get("id") == message_id for e in entries):
+                    entry["id"] = uuid.uuid4().hex
+                entries.append(entry)
+                chat_log["dms"][key] = entries[-MAX_HISTORY:]
+                save_chat()
+            sender_event = dict(entry)
+            sender_event["room"] = target
+            recipient_event = dict(entry)
+            recipient_event["room"] = username
+            with clients_lock:
+                sender_conn = clients.get(username)
+                recipient_conn = clients.get(target)
+            if sender_conn is not None:
+                send_line(sender_conn, "MESSAGE:" + event_encode(sender_event))
+            if recipient_conn is not None and recipient_conn is not sender_conn:
+                send_line(recipient_conn, "MESSAGE:" + event_encode(recipient_event))
+            return username
+        except Exception as exc:
+            send_line(conn, "ERROR:Invalid message payload")
+            print("[MESSAGE ERROR]", username, exc)
+            return username
+
+    if line.startswith("POLL_CREATE:"):
+        try:
+            payload = event_decode(line.split(":", 1)[1])
+            room = str(payload.get("room", "general-chat")).strip()
+            poll = payload.get("poll") if isinstance(payload.get("poll"), dict) else None
+            question = str(payload.get("text", "")).strip()[:240]
+            options = list(poll.get("options", [])) if poll else []
+            if len(options) < 2 or len(options) > 6 or not question:
+                send_line(conn, "ERROR:Poll needs a question and 2-6 options")
+                return username
+            clean_options = [str(v).strip()[:120] for v in options if str(v).strip()]
+            if len(clean_options) < 2:
+                return username
+            poll_obj = {"question": question, "options": clean_options, "votes": {str(i): [] for i in range(len(clean_options))}}
+            message_id = str(payload.get("id", "")).strip() or uuid.uuid4().hex
+            entry = {"id": message_id, "sender": username, "text": question, "reply_to": payload.get("reply_to"), "reactions": {}, "kind": "poll", "poll": poll_obj}
+            if room in TEXT_CHANNELS:
+                with chat_lock:
+                    chat_log.setdefault(room, []).append(entry)
+                    chat_log[room] = chat_log[room][-MAX_HISTORY:]
+                    save_chat()
+                event = dict(entry); event["room"] = room
+                broadcast("POLL:" + event_encode(event))
+            else:
+                target = room
+                with lock:
+                    target_aid = username_map.get(target.casefold())
+                    if not target_aid:
+                        send_line(conn, "ERROR:That user does not exist")
+                        return username
+                    target = accounts[target_aid].get("username", target)
+                key = dm_key(username, target)
+                with chat_lock:
+                    chat_log["dms"].setdefault(key, []).append(entry)
+                    chat_log["dms"][key] = chat_log["dms"][key][-MAX_HISTORY:]
+                    save_chat()
+                event = dict(entry); event["room"] = target
+                recip = dict(entry); recip["room"] = username
+                with clients_lock:
+                    sender_conn = clients.get(username); target_conn = clients.get(target)
+                if sender_conn: send_line(sender_conn, "POLL:" + event_encode(event))
+                if target_conn and target_conn is not sender_conn: send_line(target_conn, "POLL:" + event_encode(recip))
+        except Exception as exc:
+            print("[POLL CREATE ERROR]", username, exc)
+        return username
+
+    if line.startswith("POLL_VOTE:"):
+        try:
+            payload = event_decode(line.split(":", 1)[1])
+            room = str(payload.get("room", "general-chat")).strip()
+            mid = str(payload.get("message_id", "")).strip()
+            option = int(payload.get("option", -1))
+            entry, entries = find_message(room, mid, username)
+            if entry is None or entry.get("kind") != "poll":
+                return username
+            poll = entry.get("poll") if isinstance(entry.get("poll"), dict) else None
+            if not poll or option < 0 or option >= len(poll.get("options", [])):
+                return username
+            votes = poll.setdefault("votes", {})
+            for users in votes.values():
+                if username in users:
+                    users.remove(username)
+            votes.setdefault(str(option), []).append(username)
+            with chat_lock:
+                save_chat()
+            event = {"room": room, "message_id": mid, "poll": poll}
+            if room in TEXT_CHANNELS:
+                broadcast("POLL_VOTE:" + event_encode(event))
+            else:
+                recip = dict(event); recip["room"] = username
+                with clients_lock:
+                    sender_conn = clients.get(username); target_conn = clients.get(room)
+                if sender_conn: send_line(sender_conn, "POLL_VOTE:" + event_encode(event))
+                if target_conn and target_conn is not sender_conn: send_line(target_conn, "POLL_VOTE:" + event_encode(recip))
+        except Exception as exc:
+            print("[POLL VOTE ERROR]", username, exc)
+        return username
+
+    if line.startswith("REACT:"):
+        try:
+            payload = event_decode(line.split(":", 1)[1])
+            room = str(payload.get("room", "general-chat")).strip()
+            message_id = str(payload.get("message_id", "")).strip()
+            emoji = str(payload.get("emoji", ""))[:8]
+            if not message_id or not emoji:
+                return username
+            entry, entries = find_message(room, message_id, username)
+            if entry is None:
+                return username
+            reactions = entry.setdefault("reactions", {})
+            users = reactions.setdefault(emoji, [])
+            # Toggling the same reaction makes the button behave like a switch.
+            if username in users:
+                users.remove(username)
+            else:
+                users.append(username)
+            if not users:
+                reactions.pop(emoji, None)
+            with chat_lock:
+                save_chat()
+            event_sender = {"room": room, "message_id": message_id, "emoji": emoji, "user": username, "active": username in reactions.get(emoji, [])}
+            if room in TEXT_CHANNELS:
+                broadcast("REACTION:" + event_encode(event_sender))
+            else:
+                partner = room
+                event_recipient = dict(event_sender)
+                event_recipient["room"] = username
+                with clients_lock:
+                    sender_conn = clients.get(username)
+                    recipient_conn = clients.get(partner)
+                if sender_conn is not None:
+                    send_line(sender_conn, "REACTION:" + event_encode(event_sender))
+                if recipient_conn is not None and recipient_conn is not sender_conn:
+                    send_line(recipient_conn, "REACTION:" + event_encode(event_recipient))
+            return username
+        except Exception as exc:
+            print("[REACTION ERROR]", username, exc)
+            return username
+
+    if line.startswith("DELETE:"):
+        try:
+            payload = event_decode(line.split(":", 1)[1])
+            room = str(payload.get("room", "general-chat")).strip()
+            message_id = str(payload.get("message_id", "")).strip()
+            entry, entries = find_message(room, message_id, username)
+            if entry is None:
+                return username
+            if entry.get("sender") != username:
+                send_line(conn, "ERROR:You can only delete your own messages")
+                return username
+            with chat_lock:
+                if room in TEXT_CHANNELS:
+                    chat_log[room] = [e for e in chat_log.get(room, []) if e.get("id") != message_id]
+                else:
+                    key = dm_key(username, room)
+                    chat_log.setdefault("dms", {})[key] = [e for e in chat_log.get("dms", {}).get(key, []) if e.get("id") != message_id]
+                save_chat()
+            event_sender = {"room": room, "message_id": message_id}
+            if room in TEXT_CHANNELS:
+                broadcast("MESSAGE_DELETED:" + event_encode(event_sender))
+            else:
+                partner = room
+                event_recipient = {"room": username, "message_id": message_id}
+                with clients_lock:
+                    sender_conn = clients.get(username)
+                    recipient_conn = clients.get(partner)
+                if sender_conn is not None:
+                    send_line(sender_conn, "MESSAGE_DELETED:" + event_encode(event_sender))
+                if recipient_conn is not None and recipient_conn is not sender_conn:
+                    send_line(recipient_conn, "MESSAGE_DELETED:" + event_encode(event_recipient))
+            return username
+        except Exception as exc:
+            print("[DELETE ERROR]", username, exc)
+            return username
 
     if line.startswith("PFP:"):
         b64 = line.split(":", 1)[1].strip()
