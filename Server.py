@@ -3,11 +3,18 @@ import threading
 
 HOST = "0.0.0.0"
 PORT = 12145
+VOICE_PORT = 12146
 
-clients = {}       # username -> connection
-clients_pfp = {}   # username -> base64 png string (last known pfp)
+clients = {}        # username -> connection
+clients_pfp = {}     # username -> base64 png string (last known pfp)
+server_icon_b64 = None  # base64 png string for the shared "server" icon, or None
 clients_lock = threading.Lock()
 
+voice_clients = {}   # addr -> username
+voice_lock = threading.Lock()
+
+
+# ---------------- Text / chat TCP server ----------------
 
 def handle_client(connection, address):
     username = None
@@ -42,17 +49,26 @@ def handle_client(connection, address):
 
 
 def process_line(message, username, connection, address):
+    global server_icon_b64
+
     if message.startswith("AUTH:"):
         username = message.split(":", 1)[1].strip()
         with clients_lock:
             clients[username] = connection
-            existing_pfps = dict(clients_pfp)  # snapshot to send to the new client
+            existing_pfps = dict(clients_pfp)
+            current_server_icon = server_icon_b64
         print(f"[AUTH] {username} connected from {address}")
 
-        # Catch the new client up on everyone's current pfp
+        # Catch the new client up on everyone's current pfp...
         for other_user, b64 in existing_pfps.items():
             try:
                 connection.sendall(f"PFP:{other_user}:{b64}\n".encode('utf-8'))
+            except Exception:
+                pass
+        # ...and the current shared server icon, if one has been set.
+        if current_server_icon:
+            try:
+                connection.sendall(f"SERVERPFP:{current_server_icon}\n".encode('utf-8'))
             except Exception:
                 pass
 
@@ -89,6 +105,13 @@ def process_line(message, username, connection, address):
                 clients_pfp[username] = b64_payload
             broadcast(f"PFP:{username}:{b64_payload}\n")
 
+    elif message.startswith("SERVERPFP:"):
+        # Client is uploading/updating the shared server icon.
+        b64_payload = message.split(":", 1)[1]
+        with clients_lock:
+            server_icon_b64 = b64_payload
+        broadcast(f"SERVERPFP:{b64_payload}\n")
+
     return username
 
 
@@ -111,7 +134,45 @@ def broadcast_user_list():
     broadcast(user_list_str)
 
 
+# ---------------- Voice UDP relay ----------------
+# Very small "everyone hears everyone" relay: clients REGISTER their
+# address, then any audio packet coming from a known address gets
+# forwarded to every other known address. No mixing, no encoding.
+
+def voice_relay():
+    voice_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    voice_sock.bind((HOST, VOICE_PORT))
+    print(f"[*] Voice relay listening on {HOST}:{VOICE_PORT}")
+    while True:
+        try:
+            data, addr = voice_sock.recvfrom(4096)
+        except Exception:
+            continue
+
+        if data.startswith(b"REGISTER:"):
+            username = data.split(b":", 1)[1].decode('utf-8', errors='ignore')
+            with voice_lock:
+                voice_clients[addr] = username
+            print(f"[VOICE] {username} joined voice from {addr}")
+            continue
+
+        if data.startswith(b"UNREGISTER:"):
+            with voice_lock:
+                voice_clients.pop(addr, None)
+            continue
+
+        with voice_lock:
+            targets = [a for a in voice_clients if a != addr]
+        for target_addr in targets:
+            try:
+                voice_sock.sendto(data, target_addr)
+            except Exception:
+                pass
+
+
 def start_server():
+    threading.Thread(target=voice_relay, daemon=True).start()
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((HOST, PORT))
