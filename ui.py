@@ -42,9 +42,10 @@ ENV_FILE = os.path.join(CONFIG_DIR, ".env")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 load_dotenv(ENV_FILE, override=True)
 
-HOST = '108.221.36.120'
-PORT = 12145
-VOICE_PORT = 12146
+DEFAULT_HOST = '216.110.170.248'
+PORT = 12155
+VOICE_PORT = 12156
+MAIN_PORT = 12145
 
 VOICE_CHUNK = 1024
 VOICE_RATE = 16000
@@ -95,32 +96,60 @@ def resample_pcm16_mono(data, src_rate, dst_rate):
 
 
 def generate_ping_wav(style="ping"):
-    """Generate one of several built-in notification sounds."""
-    sounds = {
-        "ping": (880, 0.15, 0.30),
-        "ping_2": (660, 0.18, 0.28),
-        "ping_3": (1047, 0.12, 0.28),
-        "ping_4": (523, 0.22, 0.26),
-        "ping_5": (740, 0.20, 0.30),
+    """Generate a pleasant multi-note notification sound and cache it safely."""
+    # Short two/three-note chimes instead of single-frequency beeps.
+    melodies = {
+        "ping":  [(659.25, 0.00, 0.11), (783.99, 0.09, 0.16), (1046.50, 0.18, 0.20)],
+        "ping_2": [(523.25, 0.00, 0.12), (659.25, 0.10, 0.15), (783.99, 0.20, 0.19)],
+        "ping_3": [(783.99, 0.00, 0.10), (987.77, 0.08, 0.13), (1174.66, 0.16, 0.18)],
+        "ping_4": [(392.00, 0.00, 0.13), (523.25, 0.11, 0.16), (659.25, 0.22, 0.21)],
+        "ping_5": [(587.33, 0.00, 0.10), (739.99, 0.08, 0.13), (880.00, 0.16, 0.18)],
     }
-    freq, duration, volume = sounds.get(style, sounds["ping"])
-    path = os.path.join(tempfile.gettempdir(), f"netra_{style}.wav")
+    melody = melodies.get(style, melodies["ping"])
+    path = os.path.join(tempfile.gettempdir(), f"netra_{style}_v2.wav")
     if os.path.exists(path):
         return path
+
     framerate = 44100
-    n_samples = int(framerate * duration)
-    with wave.open(path, "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(framerate)
-        frames = bytearray()
-        for i in range(n_samples):
-            # Small fade-in/out keeps the notification from clicking.
-            t = i / framerate
-            fade = min(1.0, i / (framerate * 0.01), (n_samples - i) / (framerate * 0.02))
-            value = int(32767 * volume * fade * math.sin(2 * math.pi * freq * t))
-            frames += struct.pack("<h", value)
-        wf.writeframes(bytes(frames))
+    tail = 0.18
+    total_duration = max(start + duration for _, start, duration in melody) + tail
+    n_samples = int(framerate * total_duration)
+    frames = bytearray()
+
+    for i in range(n_samples):
+        t = i / framerate
+        sample = 0.0
+        for freq, start_time, duration in melody:
+            local = t - start_time
+            if 0.0 <= local < duration:
+                # Smooth attack/release to avoid clicks.
+                attack = min(1.0, local / 0.018)
+                release = min(1.0, (duration - local) / 0.055)
+                env = attack * release
+                # Fundamental + quiet upper harmonics makes it less harsh/monotone.
+                sample += env * (
+                    0.78 * math.sin(2 * math.pi * freq * local)
+                    + 0.16 * math.sin(2 * math.pi * freq * 2 * local)
+                    + 0.06 * math.sin(2 * math.pi * freq * 3 * local)
+                )
+
+        sample *= 0.22
+        sample = max(-1.0, min(1.0, sample))
+        frames += struct.pack("<h", int(32767 * sample))
+
+    try:
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(framerate)
+            wf.writeframes(bytes(frames))
+    except Exception:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+        raise
     return path
 
 
@@ -206,13 +235,38 @@ class FullDiscordClone(ctk.CTk):
         self.configure(fg_color=BG_ROOT)
 
         self.client_socket = None
-        self.current_target = "GLOBAL"
-        self.chat_history = {"GLOBAL": []}
+        self.server_host = os.getenv("NETRA_SERVER_IP", DEFAULT_HOST)
+        self.server_port = PORT
+        self.voice_port = VOICE_PORT
+        if ":" in self.server_host and self.server_host.count(":") == 1:
+            _h,_p=self.server_host.rsplit(":",1)
+            if _p.isdigit(): self.server_host,self.server_port=_h,int(_p)
+        self.account_id = os.getenv("NETRA_ACCOUNT_ID", "")
+        self.authenticated = False
+        self.auth_window = None
+        self.auth_waiting = True
+        self.current_target = "general-chat"
+        self.chat_history = {"general-chat": [], "random": []}
         self.all_rendered_widgets = []
+        self.chat_room_frames = {}
+        self.chat_room_built = set()
+        self.dm_list_buttons = {}
+        self.last_dm_partners = None
         self.last_user_list = []
         self.online_user_set = set()
         self.last_voice_user_list = []
         self.sidebar_mode = "server"  # "server" or "dms"
+        self.server_channels = ["general-chat", "random"]
+        self.unread_counts = {}
+        self.presence_status = {}
+        self.custom_status = {}
+        self.typing_users = {}
+        self.reactions = {}
+        self.pinned_messages = {}
+        self.message_ids = {}
+        self.draft_messages = {}
+        self.favorites = set()
+        self.blocked_users = set()
 
         # username -> PIL.Image, so we can regenerate CTkImages at any size
         self.default_pil_pfp = Image.new('RGB', (40, 40), color='#0F3D0F')
@@ -254,13 +308,20 @@ class FullDiscordClone(ctk.CTk):
         self.channel_sidebar = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color=BG_PANEL)
         self.channel_sidebar.pack(side="left", fill="y")
 
-        self.server_title = ctk.CTkLabel(self.channel_sidebar, text="NETRA // Main Server", font=(FONT_MONO, 14, "bold"), text_color=FG_BRIGHT)
-        self.server_title.pack(pady=15, padx=15, anchor="w")
+        self.server_title = ctk.CTkLabel(self.channel_sidebar, text="NETRA // SERVER", font=(FONT_MONO, 14, "bold"), text_color=FG_BRIGHT)
+        self.server_title.pack(pady=(15, 5), padx=15, anchor="w")
+        self.server_ip_small = ctk.CTkLabel(self.channel_sidebar, text=f"{self.server_host}:{self.server_port}", font=(FONT_MONO, 9), text_color=FG_FAINT)
+        self.server_ip_small.pack(pady=(0, 10), padx=15, anchor="w")
 
         self.sidebar_body = ctk.CTkFrame(self.channel_sidebar, fg_color="transparent", corner_radius=0)
         self.sidebar_body.pack(fill="both", expand=True)
 
-        self.channel_btn = ctk.CTkButton(self.sidebar_body, text="# general-chat", font=(FONT_MONO, 12, "bold"), fg_color=BTN_HOVER, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=self.go_to_server_view)
+        self.channel_btn = ctk.CTkButton(self.sidebar_body, text="# general-chat", font=(FONT_MONO, 12, "bold"), fg_color=BTN_HOVER, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=lambda: self.select_channel("general-chat"))
+        self.channel_btn.pack(fill="x", padx=8, pady=(4, 2))
+        self.random_channel_btn = ctk.CTkButton(self.sidebar_body, text="# random", font=(FONT_MONO, 12, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=lambda: self.select_channel("random"))
+        self.random_channel_btn.pack(fill="x", padx=8, pady=2)
+        self.feature_btn = ctk.CTkButton(self.sidebar_body, text="✨ NETRA HUB", font=(FONT_MONO, 11, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=30, corner_radius=0, command=self.open_netra_hub)
+        self.feature_btn.pack(fill="x", padx=8, pady=(8,2))
         self.voice_btn = ctk.CTkButton(self.sidebar_body, text="🎤 Join Voice", font=(FONT_MONO, 12, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=self.toggle_voice_chat)
         self.voice_mute_btn = ctk.CTkButton(self.sidebar_body, text="🔇 Mute Mic", font=(FONT_MONO, 11, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=28, corner_radius=0, command=self.toggle_voice_mute)
         self.dm_list_frame = ctk.CTkFrame(self.sidebar_body, fg_color="transparent", corner_radius=0)
@@ -281,14 +342,21 @@ class FullDiscordClone(ctk.CTk):
         self.username_entry = ctk.CTkEntry(self.user_section, width=140, height=28, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 11, "bold"), justify="center")
         self.username_entry.insert(0, saved_user)
         self.username_entry.pack(pady=(0, 12), padx=15)
-        self.username_entry.bind("<Return>", lambda event: self.connect_and_auth())
+        self.username_entry.configure(state="disabled")
 
         self.settings_btn = ctk.CTkButton(
             self.user_section, text="⚙ SETTINGS", font=(FONT_MONO, 10, "bold"),
             fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT,
             height=24, width=120, corner_radius=0, command=self.open_settings
         )
-        self.settings_btn.pack(pady=(0, 8))
+        self.settings_btn.pack(pady=(0, 4))
+
+        self.rename_btn = ctk.CTkButton(
+            self.user_section, text="CHANGE USERNAME", font=(FONT_MONO, 9, "bold"),
+            fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT,
+            height=22, width=120, corner_radius=0, command=self.rename_username
+        )
+        self.rename_btn.pack(pady=(0, 8))
 
         # ---------------- Right Active User Panel ----------------
         self.member_sidebar = ctk.CTkFrame(self, width=180, corner_radius=0, fg_color=BG_PANEL)
@@ -311,9 +379,26 @@ class FullDiscordClone(ctk.CTk):
         self.main_chat_area = ctk.CTkFrame(self, fg_color=BG_ROOT, corner_radius=0)
         self.main_chat_area.pack(side="right", fill="both", expand=True)
 
-        # decorative retro divider (as close to "scanlines" as a widget-based UI can do)
+        # ---------------- Server connection bar ----------------
+        self.server_bar = ctk.CTkFrame(self.main_chat_area, fg_color=BG_PANEL, corner_radius=0, height=48)
+        self.server_bar.pack(fill="x", padx=10, pady=(8, 0))
+        ctk.CTkLabel(self.server_bar, text="SERVER", font=(FONT_MONO, 10, "bold"), text_color=FG_DIM).pack(side="left", padx=(10, 6))
+        self.server_ip_entry = ctk.CTkEntry(self.server_bar, width=230, height=30, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 11))
+        self.server_ip_entry.insert(0, self.server_host)
+        self.server_ip_entry.pack(side="left", padx=4)
+        self.server_ip_entry.bind("<Return>", lambda event: self.connect_to_server_from_bar())
+        self.server_connect_btn = ctk.CTkButton(self.server_bar, text="CONNECT", width=90, height=30, corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black", font=(FONT_MONO, 10, "bold"), command=self.connect_to_server_from_bar)
+        self.server_connect_btn.pack(side="left", padx=6)
+        self.search_btn = ctk.CTkButton(self.server_bar, text="SEARCH", width=80, height=30, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9, "bold"), command=self.open_search)
+        self.search_btn.pack(side="left", padx=2)
+        self.browser_btn = ctk.CTkButton(self.server_bar, text="SERVERS", width=80, height=30, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9, "bold"), command=self.open_server_browser)
+        self.browser_btn.pack(side="left", padx=2)
+        self.server_status_label = ctk.CTkLabel(self.server_bar, text="offline", font=(FONT_MONO, 9), text_color=FG_FAINT)
+        self.server_status_label.pack(side="right", padx=10)
+
+        # decorative retro divider
         self.scanline_deco = ctk.CTkLabel(self.main_chat_area, text="·" * 160, font=(FONT_MONO, 8), text_color=BORDER_GREEN, anchor="w")
-        self.scanline_deco.pack(fill="x", padx=10, pady=(6, 0))
+        self.scanline_deco.pack(fill="x", padx=10, pady=(4, 0))
 
         self.chat_scroll = ctk.CTkScrollableFrame(self.main_chat_area, fg_color=BG_ROOT, corner_radius=0, label_text="")
         self.chat_scroll.pack(fill="both", expand=True, padx=10, pady=(5, 10))
@@ -321,29 +406,61 @@ class FullDiscordClone(ctk.CTk):
         self.input_container = ctk.CTkFrame(self.main_chat_area, fg_color=BG_ROOT, height=60, corner_radius=0)
         self.input_container.pack(fill="x", side="bottom", padx=20, pady=(0, 20))
 
-        self.message_entry = ctk.CTkEntry(self.input_container, placeholder_text="Message #general-chat", height=44, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, placeholder_text_color=FG_FAINT, font=(FONT_MONO, 13))
+        self.message_entry = ctk.CTkEntry(self.input_container, placeholder_text=f"Message #{self.current_target}", height=44, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, placeholder_text_color=FG_FAINT, font=(FONT_MONO, 13))
         self.message_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.message_entry.bind("<Return>", lambda event: self.send_message())
+        self.message_entry.bind("<KeyRelease>", lambda event: self.send_typing_indicator())
 
         self.send_button = ctk.CTkButton(self.input_container, text="SEND", width=80, height=44, corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black", font=(FONT_MONO, 13, "bold"), command=self.send_message)
         self.send_button.pack(side="right")
 
         self.show_server_view()
 
-        self.after(500, self.connect_and_auth)
+        self.after(250, self.open_auth_window)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def select_channel(self, channel):
+        if channel not in self.server_channels:
+            return
+        self.sidebar_mode = "server"
+        self.current_target = channel
+        self.unread_counts[channel]=0
+        self.server_title.configure(text="NETRA // SERVER")
+        self.channel_btn.configure(fg_color=BTN_HOVER if channel == "general-chat" else BTN_BG)
+        self.random_channel_btn.configure(fg_color=BTN_HOVER if channel == "random" else BTN_BG)
+        self.show_chat_room(channel)
+        self.update_input_placeholder()
+
+    def connect_to_server_from_bar(self):
+        host = self.server_ip_entry.get().strip()
+        if not host:
+            return
+        server_port = PORT
+        if ":" in host and host.count(":") == 1:
+            raw_host, raw_port = host.rsplit(":", 1)
+            if raw_port.isdigit():
+                host, server_port = raw_host.strip(), int(raw_port)
+        self.server_host = host
+        self.server_port = server_port
+        self.voice_port = server_port + 1
+        set_key(ENV_FILE, "NETRA_SERVER_IP", f"{host}:{server_port}")
+        self.server_ip_small.configure(text=f"{host}:{server_port}")
+        self.server_status_label.configure(text="connecting...", text_color=FG_DIM)
+        self.authenticated = False
+        self.open_auth_window()
 
     # ---------- Sidebar navigation (server channels <-> DMs) ----------
 
     def go_to_server_view(self):
         self.show_server_view()
-        self.select_global_channel()
+        self.select_channel("general-chat")
 
     def show_server_view(self):
         self.sidebar_mode = "server"
-        self.server_title.configure(text="Main Server")
+        self.server_title.configure(text="NETRA // SERVER")
         self.dm_list_frame.pack_forget()
-        self.channel_btn.pack(fill="x", padx=10, pady=5)
+        self.channel_btn.pack(fill="x", padx=10, pady=(4, 2))
+        self.random_channel_btn.pack(fill="x", padx=10, pady=2)
         self.voice_btn.pack(fill="x", padx=10, pady=(0, 2))
         self.voice_mute_btn.pack(fill="x", padx=10, pady=(0, 5))
 
@@ -351,42 +468,60 @@ class FullDiscordClone(ctk.CTk):
         self.sidebar_mode = "dms"
         self.server_title.configure(text="Direct Messages")
         self.channel_btn.pack_forget()
+        self.random_channel_btn.pack_forget()
         self.voice_btn.pack_forget()
         self.voice_mute_btn.pack_forget()
+        self.dm_list_frame.pack(fill="both", expand=True)
 
-        if self.current_target == "GLOBAL":
-            candidates = sorted(set(self.chat_history.keys()) - {"GLOBAL"})
+        if self.current_target in self.server_channels:
+            candidates = sorted(set(self.chat_history.keys()) - set(self.server_channels))
             if candidates:
                 self.current_target = candidates[0]
                 self.message_entry.configure(placeholder_text=f"Message @{self.current_target}")
 
         self.refresh_dm_list()
-        self.dm_list_frame.pack(fill="both", expand=True)
-        self.reload_current_chat_view()
+        self.show_chat_room(self.current_target)
 
     def refresh_dm_list(self):
-        for widget in self.dm_list_frame.winfo_children():
-            widget.destroy()
-
         my_name = self.username_entry.get().strip()
-        partners = set(self.chat_history.keys()) - {"GLOBAL"}
-        # last_user_list is the persistent account list sent by the server,
-        # so offline accounts remain available for DMs.
+        partners = set(self.chat_history.keys()) - set(self.server_channels)
         partners |= set(u for u in self.last_user_list if u != my_name)
         partners.discard(my_name)
+        partners_tuple = tuple(sorted(partners, key=str.lower))
 
-        if not partners:
+        # Don't destroy/recreate the entire DM sidebar every time a message or
+        # presence update arrives. That was causing visible lag and occasional
+        # blank DMs while Tk rebuilt the widgets.
+        if partners_tuple == self.last_dm_partners:
+            for user, btn in self.dm_list_buttons.items():
+                btn.configure(fg_color=(BTN_HOVER if user == self.current_target else "transparent"))
+            return
+
+        self.last_dm_partners = partners_tuple
+        for widget in self.dm_list_frame.winfo_children():
+            widget.destroy()
+        self.dm_list_buttons.clear()
+
+        if not partners_tuple:
             lbl = ctk.CTkLabel(self.dm_list_frame, text="No conversations yet.\nClick a name on the right\nto start one.", font=(FONT_MONO, 11), text_color=FG_FAINT, justify="left")
             lbl.pack(anchor="w", padx=10, pady=10)
             return
 
-        for user in sorted(partners):
+        for user in partners_tuple:
             avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
-            is_selected = (user == self.current_target)
-            btn = ctk.CTkButton(self.dm_list_frame, image=avatar_img, text=f"  {user}", compound="left", font=(FONT_MONO, 12, "bold"), corner_radius=0, fg_color=(BTN_HOVER if is_selected else "transparent"), text_color=FG_BRIGHT, anchor="w", height=32, hover_color=BTN_HOVER, command=lambda u=user: self.select_dm_channel(u))
+            btn = ctk.CTkButton(
+                self.dm_list_frame, image=avatar_img, text=f"  {user}",
+                compound="left", font=(FONT_MONO, 12, "bold"),
+                corner_radius=0,
+                fg_color=(BTN_HOVER if user == self.current_target else "transparent"),
+                text_color=FG_BRIGHT, anchor="w", height=32,
+                hover_color=BTN_HOVER,
+                command=lambda u=user: self.select_dm_channel(u))
             btn.pack(fill="x", padx=10, pady=2)
+            self.dm_list_buttons[user] = btn
 
     # ---------- PFP helpers ----------
+
 
     def load_saved_profile(self):
         saved_pfp_path = os.getenv("CHAT_PFP_PATH", "")
@@ -513,23 +648,29 @@ class FullDiscordClone(ctk.CTk):
             return False
 
     def play_ping_sound(self):
-        """Play the configured DM notification sound without blocking the UI."""
+        """Play the configured notification sound without blocking the UI."""
         if self.dm_sound_mode == "off":
             return
         try:
-            if self.dm_sound_mode == "custom" and self.dm_sound_path and os.path.exists(self.dm_sound_path):
+            if self.dm_sound_mode == "custom" and self.dm_sound_path and os.path.isfile(self.dm_sound_path):
                 path = self.dm_sound_path
             else:
                 path = generate_ping_wav(self.dm_sound_mode)
+
             if os.name == "nt":
                 import winsound
-                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                # SND_ASYNC keeps the network/UI thread responsive.
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
             elif sys.platform == "darwin":
                 subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 subprocess.Popen(["aplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+        except Exception as e:
+            # Do not silently disable notifications if a sound file fails.
+            try:
+                self.after(0, self.append_system_error, f"Notification sound failed: {e}")
+            except Exception:
+                pass
 
     def open_settings(self):
         win = ctk.CTkToplevel(self)
@@ -670,33 +811,110 @@ class FullDiscordClone(ctk.CTk):
 
     # ---------- Networking ----------
 
-    def connect_and_auth(self):
-        username = self.username_entry.get().strip()
-        if not username:
+    def open_auth_window(self):
+        if self.auth_window is not None and self.auth_window.winfo_exists():
+            self.auth_window.focus_force()
             return
+        win = ctk.CTkToplevel(self)
+        self.auth_window = win
+        win.title("NETRA // Account")
+        win.geometry("430x430")
+        win.resizable(False, False)
+        win.configure(fg_color=BG_PANEL)
+        win.transient(self)
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        if not os.path.exists(ENV_FILE):
-            with open(ENV_FILE, 'w') as f:
-                pass
-        set_key(ENV_FILE, "CHAT_USERNAME", username)
+        ctk.CTkLabel(win, text="NETRA // ACCOUNT", font=(FONT_MONO, 22, "bold"), text_color=FG_BRIGHT).pack(pady=(28, 4))
+        ctk.CTkLabel(win, text="Sign in to your permanent NETRA identity", font=(FONT_MONO, 11), text_color=FG_DIM).pack(pady=(0, 22))
 
+        mode = ctk.StringVar(value="LOGIN")
+        username = ctk.CTkEntry(win, placeholder_text="Username", width=320, height=42, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 13))
+        username.pack(pady=8)
+        password = ctk.CTkEntry(win, placeholder_text="Password", show="•", width=320, height=42, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 13))
+        password.pack(pady=8)
+
+        status = ctk.CTkLabel(win, text="", font=(FONT_MONO, 10), text_color=ERROR_RED, wraplength=340)
+        status.pack(pady=(8, 10))
+
+        def submit():
+            u = username.get().strip()
+            pw = password.get()
+            if not u or not pw:
+                status.configure(text="Enter a username and password.")
+                return
+            self._auth_username = u
+            self._auth_password = pw
+            self._auth_mode = mode.get()
+            self._auth_status_label = status
+            self.connect_and_auth(u, pw, self._auth_mode)
+
+        ctk.CTkButton(win, text="LOGIN", width=145, height=40, corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black", font=(FONT_MONO, 12, "bold"), command=lambda: (mode.set("LOGIN"), submit())).pack(pady=(4, 6))
+        ctk.CTkButton(win, text="CREATE ACCOUNT", width=145, height=40, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 11, "bold"), command=lambda: (mode.set("REGISTER"), submit())).pack(pady=4)
+        ctk.CTkLabel(win, text="Your username can be changed later without creating a new person.\nPasswords are stored as salted PBKDF2 hashes on the server.", font=(FONT_MONO, 9), text_color=FG_FAINT, justify="center").pack(pady=(18, 0))
+        username.focus_set()
+
+    def connect_and_auth(self, username=None, password=None, mode="LOGIN"):
+        username = (username if username is not None else self.username_entry.get()).strip()
+        if not username or password is None:
+            return
+        import base64
+        encoded_password = base64.b64encode(password.encode("utf-8")).decode("ascii")
         if self.client_socket:
             try:
                 self.client_socket.close()
-            except:
+            except Exception:
                 pass
-
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((HOST, PORT))
+            self.client_socket.connect((self.server_host, self.server_port))
             self.loading_history = True
             self._history_ready = False
-            self.client_socket.sendall(f"AUTH:{username}\n".encode('utf-8'))
-            self.user_pil_pfps[username] = self.pil_pfp
-            self.send_own_pfp()
+            self.authenticated = False
+            self.client_socket.sendall(f"{mode}:{username}:{encoded_password}\n".encode("utf-8"))
             threading.Thread(target=self.receive_messages_loop, daemon=True).start()
         except Exception as e:
-            self.append_system_error(f"Could not link to server at {HOST}: {e}")
+            if getattr(self, "_auth_status_label", None):
+                self._auth_status_label.configure(text=f"Could not connect: {e}")
+            else:
+                self.append_system_error(f"Could not link to server at {self.server_host}: {e}")
+
+    def rename_username(self):
+        if not self.authenticated or not self.client_socket:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("NETRA // Change Username")
+        win.geometry("380x220")
+        win.resizable(False, False)
+        win.configure(fg_color=BG_PANEL)
+        win.transient(self)
+        win.grab_set()
+        ctk.CTkLabel(win, text="CHANGE USERNAME", font=(FONT_MONO, 18, "bold"), text_color=FG_BRIGHT).pack(pady=(24, 8))
+        entry = ctk.CTkEntry(win, width=280, height=38, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 12))
+        entry.pack(pady=8)
+        status = ctk.CTkLabel(win, text="", font=(FONT_MONO, 9), text_color=ERROR_RED)
+        status.pack(pady=5)
+        def do_rename():
+            value = entry.get().strip()
+            if not value:
+                return
+            self._rename_status_label = status
+            try:
+                self.client_socket.sendall(f"RENAME:{value}\n".encode("utf-8"))
+            except Exception as e:
+                status.configure(text=str(e))
+        ctk.CTkButton(win, text="SAVE NAME", width=130, height=34, corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black", command=do_rename).pack(pady=8)
+        entry.focus_set()
+
+    def _finish_auth_window(self):
+        if self.auth_window is not None:
+            try:
+                self.auth_window.grab_release()
+                self.auth_window.destroy()
+            except Exception:
+                pass
+            self.auth_window = None
+        self.auth_waiting = False
 
     def receive_messages_loop(self):
         buffer = ""
@@ -717,6 +935,62 @@ class FullDiscordClone(ctk.CTk):
     def handle_incoming_line(self, raw_message):
         my_name = self.username_entry.get().strip()
 
+        if raw_message.startswith("AUTH_OK:"):
+            parts = raw_message.split(":", 2)
+            if len(parts) == 3:
+                self.account_id = parts[1]
+                self.authenticated = True
+                name = parts[2]
+                self.username_entry.configure(state="normal")
+                self.username_entry.delete(0, "end")
+                self.username_entry.insert(0, name)
+                self.username_entry.configure(state="disabled")
+                if not os.path.exists(ENV_FILE):
+                    with open(ENV_FILE, "w", encoding="utf-8"):
+                        pass
+                set_key(ENV_FILE, "CHAT_USERNAME", name)
+                set_key(ENV_FILE, "NETRA_ACCOUNT_ID", self.account_id)
+                self.after(0, self._finish_auth_window)
+            return
+        elif raw_message.startswith("AUTH_FAIL:"):
+            self.server_status_label.configure(text="authentication failed", text_color=ERROR_RED)
+            reason = raw_message.split(":", 1)[1]
+            self.after(0, lambda: getattr(self, "_auth_status_label", None) and self._auth_status_label.configure(text=reason))
+            return
+        elif raw_message.startswith("RENAME_OK:"):
+            parts = raw_message.split(":", 2)
+            if len(parts) == 3:
+                old_name, new_name = parts[1], parts[2]
+                self.username_entry.configure(state="normal")
+                self.username_entry.delete(0, "end")
+                self.username_entry.insert(0, new_name)
+                self.username_entry.configure(state="disabled")
+                set_key(ENV_FILE, "CHAT_USERNAME", new_name)
+                self.after(0, self.refresh_dm_list)
+                label = getattr(self, "_rename_status_label", None)
+                if label is not None:
+                    label.configure(text="Username changed successfully.", text_color=FG_BRIGHT)
+                    try: label.master.after(500, label.master.destroy)
+                    except Exception: pass
+            return
+        elif raw_message.startswith("RENAME_FAIL:"):
+            reason = raw_message.split(":", 1)[1]
+            label = getattr(self, "_rename_status_label", None)
+            if label is not None:
+                self.after(0, lambda: label.configure(text=reason))
+            return
+        elif raw_message.startswith("USER_RENAMED:"):
+            parts = raw_message.split(":", 2)
+            if len(parts) == 3:
+                old_name, new_name = parts[1], parts[2]
+                if old_name in self.chat_history and new_name not in self.chat_history:
+                    self.chat_history[new_name] = self.chat_history.pop(old_name)
+                if old_name in self.user_pil_pfps:
+                    self.user_pil_pfps[new_name] = self.user_pil_pfps.pop(old_name)
+                self.after(0, self.refresh_dm_list)
+                self.after(0, self.update_online_users_ui, self.last_user_list, True)
+            return
+
         if raw_message.startswith("VOICEUSERS:"):
             names_raw = raw_message.split(":", 1)[1]
             voice_user_list = [u for u in names_raw.split(",") if u]
@@ -729,21 +1003,33 @@ class FullDiscordClone(ctk.CTk):
             names_raw = raw_message.split(":", 1)[1]
             online_list = [u for u in names_raw.split(",") if u]
             self.after(0, self.update_online_presence_ui, online_list)
+        elif raw_message.startswith("HIST_CHANNEL:"):
+            parts = raw_message.split(":", 3)
+            if len(parts) == 4:
+                channel, sender, text = parts[1], parts[2], parts[3]
+                self.after(0, self.store_and_render, channel, sender, text)
         elif raw_message.startswith("HIST_GLOBAL:"):
             parts = raw_message.split(":", 2)
             if len(parts) == 3:
                 sender, text = parts[1], parts[2]
-                self.after(0, self.store_and_render, "GLOBAL", sender, text)
+                self.after(0, self.store_and_render, "general-chat", sender, text)
         elif raw_message.startswith("HIST_DM:"):
             parts = raw_message.split(":", 3)
             if len(parts) == 4:
                 partner, sender, text = parts[1], parts[2], parts[3]
                 self.after(0, self.store_and_render, partner, sender, text)
+        elif raw_message.startswith("CHANNEL:"):
+            parts = raw_message.split(":", 3)
+            if len(parts) == 4:
+                channel, sender, text = parts[1], parts[2], parts[3]
+                self.after(0, self.store_and_render, channel, sender, text)
+                if sender != my_name:
+                    self.play_ping_sound()
         elif raw_message.startswith("GLOBAL:"):
             parts = raw_message.split(":", 2)
             if len(parts) == 3:
                 sender, text = parts[1], parts[2]
-                self.after(0, self.store_and_render, "GLOBAL", sender, text)
+                self.after(0, self.store_and_render, "general-chat", sender, text)
                 if sender != my_name:
                     self.play_ping_sound()
         elif raw_message.startswith("DM:"):
@@ -762,6 +1048,46 @@ class FullDiscordClone(ctk.CTk):
         elif raw_message.startswith("SERVERPFP:"):
             b64_data = raw_message.split(":", 1)[1]
             self.after(0, self.receive_server_icon, b64_data)
+        elif raw_message.startswith("STATUS:"):
+            p=raw_message.split(':',3)
+            if len(p)>=3:
+                who=p[1]; self.presence_status[who]=p[2]; self.custom_status[who]=p[3] if len(p)>3 else ''
+                self.after(0,self.update_online_users_ui,self.last_user_list,True)
+        elif raw_message.startswith("TYPING:"):
+            p=raw_message.split(':',2)
+            if len(p)==3 and p[1]!=my_name:
+                self.typing_users[p[2]]=p[1]
+                self.after(0,self.server_status_label.configure,text=f"{p[1]} is typing...")
+                self.after(1500,lambda:self.server_status_label.configure(text='connected'))
+        elif raw_message.startswith("REACTION:"):
+            p=raw_message.split(':',4)
+            if len(p)==5: self.reactions.setdefault(p[1],{}).setdefault(p[2],[]).append(f'{p[3]}:{p[4]}')
+        elif raw_message.startswith("EDITED:"):
+            p=raw_message.split(':',4)
+            if len(p)==5:
+                room,key,who,newtext=p[1:];
+                for m in self.chat_history.get(room,[]):
+                    if m.get('id')==key: m['text']=newtext; m['edited']=True
+                self.reload_current_chat_view()
+        elif raw_message.startswith("DELETED:"):
+            p=raw_message.split(':',3)
+            if len(p)==4:
+                room,key,_=p[1:]; self.chat_history[room]=[m for m in self.chat_history.get(room,[]) if m.get('id')!=key]; self.reload_current_chat_view()
+        elif raw_message.startswith("PINNED:"):
+            p=raw_message.split(':',3)
+            if len(p)==4: self.pinned_messages.setdefault(p[1],[]).append(p[2])
+        elif raw_message.startswith("SEARCH_RESULT:"):
+            p=raw_message.split(':',3)
+            if len(p)==4 and hasattr(self,'search_results_frame'):
+                ctk.CTkLabel(self.search_results_frame,text=f'[{p[1]}] {p[2]}: {p[3]}',font=(FONT_MONO,10),text_color=FG_DIM,justify='left',wraplength=480).pack(fill='x',pady=4)
+        elif raw_message.startswith("SEARCH_DONE:") or raw_message=="SEARCH_DONE":
+            pass
+        elif raw_message.startswith("CHANNEL_LIST:"):
+            self.server_channels=[x for x in raw_message.split(':',1)[1].split(',') if x]
+            self.after(0,self.refresh_channel_buttons)
+        elif raw_message.startswith("FILE:"):
+            p=raw_message.split(':',4)
+            if len(p)==5: self.after(0,self.receive_file,p[1],p[2],p[3],p[4])
         elif raw_message.startswith("PFP:"):
             parts = raw_message.split(":", 2)
             if len(parts) == 3:
@@ -792,13 +1118,18 @@ class FullDiscordClone(ctk.CTk):
         if chat_room not in self.chat_history:
             self.chat_history[chat_room] = []
 
-        msg_data = {"sender": sender, "text": text}
+        import hashlib as _hashlib
+        msg_id = _hashlib.sha1(f"{chat_room}|{sender}|{text}|{len(self.chat_history.get(chat_room,[]))}".encode()).hexdigest()[:12]
+        msg_data = {"id": msg_id, "sender": sender, "text": text}
         self.chat_history[chat_room].append(msg_data)
 
+        if self.current_target != chat_room and sender != self.username_entry.get().strip():
+            self.unread_counts[chat_room]=self.unread_counts.get(chat_room,0)+1
         if self.current_target == chat_room and not self.loading_history:
-            self.render_single_message(sender, text)
+            self.render_single_message(sender, text, room=chat_room)
+            self.chat_room_built.add(chat_room)
 
-        if self.sidebar_mode == "dms" and chat_room != "GLOBAL" and not self.loading_history:
+        if self.sidebar_mode == "dms" and chat_room not in self.server_channels and not self.loading_history:
             self.refresh_dm_list()
 
     def update_voice_users_ui(self, user_list):
@@ -824,6 +1155,9 @@ class FullDiscordClone(ctk.CTk):
         self.update_online_users_ui(self.last_user_list, force=True)
 
     def update_online_users_ui(self, user_list, force=False):
+        # USERS is the persistent account list so offline users can still be
+        # selected for DMs.  This panel is specifically ONLINE USERS, though,
+        # so only names from the current ONLINE list belong here.
         normalized = list(dict.fromkeys(user_list))
         if normalized == self.last_user_list and not force:
             return
@@ -832,48 +1166,87 @@ class FullDiscordClone(ctk.CTk):
             widget.destroy()
 
         my_name = self.username_entry.get().strip()
-        for user in sorted(user_list, key=str.lower):
-            if user == my_name:
-                continue
-            avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
-            online = user in self.online_user_set
-            status = "●" if online else "○"
-            status_color = FG_BRIGHT if online else FG_FAINT
-            btn = ctk.CTkButton(
-                self.user_list_frame, image=avatar_img,
-                text=f"  {status} {user}", compound="left",
-                font=(FONT_MONO, 12, "bold"), corner_radius=0,
-                fg_color="transparent", text_color=(FG_BRIGHT if online else FG_DIM),
-                anchor="w", height=32, hover_color=BTN_HOVER,
-                command=lambda u=user: self.select_dm_channel(u))
-            btn.pack(fill="x", padx=10, pady=2)
+        online_users = sorted(
+            (u for u in normalized if u in self.online_user_set and u != my_name),
+            key=str.lower,
+        )
+
+        if not online_users:
+            empty = ctk.CTkLabel(
+                self.user_list_frame,
+                text="No other users online",
+                font=(FONT_MONO, 10),
+                text_color=FG_FAINT,
+                anchor="w",
+            )
+            empty.pack(fill="x", padx=10, pady=4)
+        else:
+            for user in online_users:
+                avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
+                btn = ctk.CTkButton(
+                    self.user_list_frame, image=avatar_img,
+                    text=f"  ● {user}", compound="left",
+                    font=(FONT_MONO, 12, "bold"), corner_radius=0,
+                    fg_color="transparent", text_color=FG_BRIGHT,
+                    anchor="w", height=32, hover_color=BTN_HOVER,
+                    command=lambda u=user: self.select_dm_channel(u))
+                btn.pack(fill="x", padx=10, pady=2)
 
         if self.sidebar_mode == "dms":
             self.refresh_dm_list()
 
     def select_global_channel(self):
-        self.current_target = "GLOBAL"
-        self.message_entry.configure(placeholder_text="Message #general-chat")
-        self.channel_btn.configure(fg_color=BTN_HOVER)
-        self.reload_current_chat_view()
+        self.select_channel("general-chat")
 
     def select_dm_channel(self, username):
+        if not username or username == self.username_entry.get().strip():
+            return
+        already_selected = (self.current_target == username and self.sidebar_mode == "dms")
         self.current_target = username
+        self.unread_counts[username]=0
         self.message_entry.configure(placeholder_text=f"Message @{username}")
-        self.show_dm_view()
+        if self.sidebar_mode != "dms":
+            self.show_dm_view()
+        else:
+            self.refresh_dm_list()
+            if not already_selected:
+                self.show_chat_room(username)
+
+    def get_chat_room_frame(self, room):
+        frame = self.chat_room_frames.get(room)
+        if frame is None or not frame.winfo_exists():
+            frame = ctk.CTkFrame(self.chat_scroll, fg_color="transparent", corner_radius=0)
+            self.chat_room_frames[room] = frame
+            self.chat_room_built.discard(room)
+        return frame
+
+    def show_chat_room(self, room):
+        frame = self.get_chat_room_frame(room)
+
+        # Hide the previous room instead of destroying all of its widgets.
+        # Switching chats is therefore just a couple of Tk operations.
+        for other in self.chat_room_frames.values():
+            if other is not frame and other.winfo_manager():
+                other.pack_forget()
+        if not frame.winfo_manager():
+            frame.pack(fill="both", expand=True, padx=5, pady=5, anchor="nw")
+
+        if room not in self.chat_room_built:
+            for msg in self.chat_history.get(room, []):
+                self.render_single_message(msg["sender"], msg["text"], room=room)
+            self.chat_room_built.add(room)
+
+        self.after_idle(self.scroll_to_bottom)
 
     def reload_current_chat_view(self):
-        for widget in self.all_rendered_widgets:
-            widget.destroy()
-        self.all_rendered_widgets.clear()
+        # Kept for the existing message/PFP update paths. It no longer rebuilds
+        # the whole conversation on every navigation.
+        self.show_chat_room(self.current_target)
 
-        messages = self.chat_history.get(self.current_target, [])
-        for msg in messages:
-            self.render_single_message(msg["sender"], msg["text"])
-        self.after(10, self.scroll_to_bottom)
-
-    def render_single_message(self, sender, text):
-        msg_frame = ctk.CTkFrame(self.chat_scroll, fg_color="transparent", corner_radius=0)
+    def render_single_message(self, sender, text, room=None):
+        room = room or self.current_target
+        parent = self.get_chat_room_frame(room)
+        msg_frame = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=0)
         msg_frame.pack(fill="x", pady=6, padx=5, anchor="w")
         self.all_rendered_widgets.append(msg_frame)
 
@@ -890,7 +1263,20 @@ class FullDiscordClone(ctk.CTk):
         text_label = ctk.CTkLabel(content_frame, text=text, font=(FONT_MONO, 13), text_color=FG_DIM, justify="left", wraplength=450)
         text_label.pack(anchor="w", pady=(2, 0))
 
-        self.after(10, self.scroll_to_bottom)
+        def menu(event):
+            m=__import__('tkinter').Menu(self,tearoff=0)
+            m.add_command(label='Reply',command=lambda:self.message_entry.insert(0,f'@{sender} '))
+            m.add_command(label='React 👍',command=lambda:self.send_reaction(room,text))
+            m.add_command(label='React ❤️',command=lambda:self.send_reaction(room,text,'❤️'))
+            m.add_command(label='Pin',command=lambda:self.send_pin(room,text))
+            if sender==self.username_entry.get().strip():
+                m.add_command(label='Edit',command=lambda:self.open_edit_message(room,text))
+                m.add_command(label='Delete',command=lambda:self.send_delete(room,text))
+            m.tk_popup(event.x_root,event.y_root)
+        for w in (msg_frame,avatar_label,content_frame,user_label,text_label): w.bind('<Button-3>',menu)
+
+        if room == self.current_target:
+            self.after_idle(self.scroll_to_bottom)
 
     def append_system_error(self, error_text):
         err_frame = ctk.CTkFrame(self.chat_scroll, fg_color="transparent", corner_radius=0)
@@ -901,22 +1287,134 @@ class FullDiscordClone(ctk.CTk):
         err_label.pack(anchor="w")
         self.after(10, self.scroll_to_bottom)
 
+    def send_typing_indicator(self):
+        if not self.client_socket or not self.authenticated: return
+        try: self.client_socket.sendall(f"TYPING:{self.current_target}\n".encode('utf-8'))
+        except Exception: pass
+
     def send_message(self):
-        message = self.message_entry.get().strip()
-        if not message or not self.client_socket:
-            return
+        message=self.message_entry.get().strip()
+        if not message or not self.client_socket or not self.authenticated: return
+        self.draft_messages.pop(self.current_target,None); self.message_entry.delete(0,'end')
+        if self.current_target in self.server_channels: payload=f"CHANNEL:{self.current_target}:{message}\n"
+        else: payload=f"DM:{self.current_target}:{message}\n"
+        try: self.client_socket.sendall(payload.encode('utf-8'))
+        except Exception as e: self.append_system_error(f"Message delivery lost: {e}")
 
-        self.message_entry.delete(0, "end")
+    def open_netra_hub(self):
+        win=ctk.CTkToplevel(self); win.title('NETRA // HUB'); win.geometry('520x620'); win.configure(fg_color=BG_ROOT); win.transient(self)
+        ctk.CTkLabel(win,text='NETRA // FEATURES',font=(FONT_MONO,20,'bold'),text_color=FG_BRIGHT).pack(pady=(20,10))
+        items=[('👤 PROFILE',self.open_profile),('🟢 PRESENCE / STATUS',self.open_status),('⭐ FAVORITES',self.open_favorites),('🔔 NOTIFICATIONS',self.open_notifications),('📌 PINNED MESSAGES',self.open_pins),('🎨 THEMES',self.open_themes),('🛡️ SERVER / CHANNEL TOOLS',self.open_channel_tools)]
+        for text,cmd in items: ctk.CTkButton(win,text=text,command=cmd,height=38,corner_radius=0,fg_color=BTN_BG,hover_color=BTN_HOVER,text_color=FG_BRIGHT,font=(FONT_MONO,11,'bold')).pack(fill='x',padx=35,pady=5)
+        ctk.CTkLabel(win,text='Right-click messages for reply / edit / delete / react / pin.',font=(FONT_MONO,9),text_color=FG_FAINT).pack(pady=18)
 
-        if self.current_target == "GLOBAL":
-            network_payload = f"GLOBAL:{message}\n"
-        else:
-            network_payload = f"DM:{self.current_target}:{message}\n"
+    def simple_window(self,title,lines,buttons=None,size='460x420'):
+        win=ctk.CTkToplevel(self); win.title(title); win.geometry(size); win.configure(fg_color=BG_ROOT); win.transient(self)
+        ctk.CTkLabel(win,text=title,font=(FONT_MONO,18,'bold'),text_color=FG_BRIGHT).pack(pady=(20,10))
+        for line in lines: ctk.CTkLabel(win,text=line,font=(FONT_MONO,10),text_color=FG_DIM,justify='left',wraplength=400).pack(anchor='w',padx=25,pady=4)
+        if buttons:
+            for label,cmd in buttons: ctk.CTkButton(win,text=label,command=cmd,height=34,corner_radius=0,fg_color=BTN_BG,hover_color=BTN_HOVER,text_color=FG_BRIGHT,font=(FONT_MONO,10,'bold')).pack(fill='x',padx=35,pady=4)
+        return win
 
+    def open_profile(self):
+        name=self.username_entry.get().strip(); status=self.presence_status.get(name,'Online'); custom=self.custom_status.get(name,'')
+        self.simple_window('NETRA // PROFILE',[f'Username: {name}',f'Status: {status}',f'Custom status: {custom or "(none)"}',f'Account ID: {self.account_id or "unknown"}'],size='480x300')
+
+    def open_status(self):
+        win=ctk.CTkToplevel(self); win.title('NETRA // STATUS'); win.geometry('420x330'); win.configure(fg_color=BG_ROOT)
+        var=ctk.StringVar(value=self.presence_status.get(self.username_entry.get().strip(),'Online')); custom=ctk.StringVar(value=self.custom_status.get(self.username_entry.get().strip(),''))
+        ctk.CTkLabel(win,text='PRESENCE',font=(FONT_MONO,18,'bold'),text_color=FG_BRIGHT).pack(pady=18)
+        ctk.CTkOptionMenu(win,variable=var,values=['Online','Idle','DND','Invisible'],fg_color=BTN_BG,button_color=FG_DIM,button_hover_color=BTN_HOVER,text_color=FG_BRIGHT).pack(pady=8)
+        ctk.CTkEntry(win,textvariable=custom,width=300,height=38,fg_color=BG_INPUT,border_color=BORDER_GREEN,text_color=FG_BRIGHT,placeholder_text='Custom status').pack(pady=8)
+        def save():
+            self.presence_status[self.username_entry.get().strip()]=var.get(); self.custom_status[self.username_entry.get().strip()]=custom.get(); self.client_socket.sendall(f'STATUS:{var.get()}:{custom.get()}\n'.encode()); win.destroy()
+        ctk.CTkButton(win,text='SAVE STATUS',command=save,fg_color=FG_DIM,text_color='black',height=36).pack(pady=12)
+
+    def open_favorites(self):
+        self.simple_window('NETRA // FAVORITES',[*(sorted(self.favorites) or ['No favorites yet.'])],size='400x300')
+
+    def open_notifications(self):
+        self.simple_window('NETRA // NOTIFICATIONS',[f'Unread rooms: {sum(self.unread_counts.values())}', 'Notifications are generated for DMs, mentions, replies, reactions and server events.'],size='460x260')
+
+    def open_pins(self):
+        pins=[]
+        for room,arr in self.pinned_messages.items(): pins += [f'[{room}] {x}' for x in arr]
+        self.simple_window('NETRA // PINNED MESSAGES',pins or ['No pinned messages in this session.'],size='500x400')
+
+    def open_themes(self):
+        self.simple_window('NETRA // THEMES',['Current theme: NETRA Terminal','CRT scanlines and accent customization are ready for the UI layer.'],size='460x240')
+
+    def open_channel_tools(self):
+        win=ctk.CTkToplevel(self); win.title('NETRA // SERVER TOOLS'); win.geometry('440x360'); win.configure(fg_color=BG_ROOT)
+        e=ctk.CTkEntry(win,placeholder_text='new-channel',width=300); e.pack(pady=25)
+        def create():
+            if e.get().strip() and self.client_socket: self.client_socket.sendall(f'CREATE_CHANNEL:{e.get().strip()}\n'.encode())
+        ctk.CTkButton(win,text='CREATE CHANNEL',command=create,fg_color=FG_DIM,text_color='black').pack(pady=8)
+        ctk.CTkLabel(win,text='Server-side permissions should be enforced before exposing this to untrusted users.',font=(FONT_MONO,9),text_color=FG_FAINT,wraplength=360).pack(pady=15)
+
+    def open_search(self):
+        win=ctk.CTkToplevel(self); win.title('NETRA // SEARCH'); win.geometry('560x500'); win.configure(fg_color=BG_ROOT)
+        e=ctk.CTkEntry(win,placeholder_text='Search messages...',width=430,height=36); e.pack(pady=15); out=ctk.CTkScrollableFrame(win,fg_color=BG_PANEL); out.pack(fill='both',expand=True,padx=15,pady=10)
+        def go():
+            for w in out.winfo_children(): w.destroy()
+            if self.client_socket: self.client_socket.sendall(f'SEARCH:{e.get().strip()}\n'.encode())
+        ctk.CTkButton(win,text='SEARCH',command=go,fg_color=FG_DIM,text_color='black').pack(pady=4)
+        self.search_results_frame=out
+
+    def open_server_browser(self):
+        win=ctk.CTkToplevel(self); win.title('NETRA // SERVER BROWSER'); win.geometry('600x500'); win.configure(fg_color=BG_ROOT)
+        out=ctk.CTkScrollableFrame(win,fg_color=BG_PANEL); out.pack(fill='both',expand=True,padx=15,pady=15)
+        def refresh():
+            for w in out.winfo_children(): w.destroy()
+            try:
+                with socket.create_connection((self.server_host,MAIN_PORT),timeout=5) as s:
+                    s.sendall(b'SERVER_LIST\n'); data=s.recv(65536).decode().strip()
+                if data.startswith('SERVERS:'):
+                    import json as _j
+                    items=_j.loads(data.split(':',1)[1])
+                    for sid,info in items.items():
+                        ctk.CTkButton(out,text=f"{info.get('name','Server')}  //  {info.get('host','')}",height=42,corner_radius=0,fg_color=BTN_BG,hover_color=BTN_HOVER,text_color=FG_BRIGHT,command=lambda hp=info.get('host',''): self.connect_to_server_address(hp)).pack(fill='x',pady=4)
+            except Exception as ex: ctk.CTkLabel(out,text=f'Main server unavailable: {ex}',text_color=ERROR_RED).pack(pady=20)
+        ctk.CTkButton(win,text='REFRESH',command=refresh,fg_color=FG_DIM,text_color='black').pack(pady=(0,12)); refresh()
+
+    def connect_to_server_address(self,hostport):
+        self.server_ip_entry.delete(0,'end'); self.server_ip_entry.insert(0,hostport); self.connect_to_server_from_bar()
+
+    def send_reaction(self,room,text,emoji='👍'):
+        import hashlib as _h; key=_h.sha1(f'{room}|{text}'.encode()).hexdigest()[:12]
+        try:self.client_socket.sendall(f'REACT:{room}:{key}:{emoji}\n'.encode())
+        except Exception:pass
+    def send_pin(self,room,text):
+        import hashlib as _h; key=_h.sha1(f'{room}|{text}'.encode()).hexdigest()[:12]
+        try:self.client_socket.sendall(f'PIN:{room}:{key}\n'.encode())
+        except Exception:pass
+    def send_delete(self,room,text):
+        import hashlib as _h; key=_h.sha1(f'{room}|{text}'.encode()).hexdigest()[:12]
+        try:self.client_socket.sendall(f'DELETE:{room}:{key}\n'.encode())
+        except Exception:pass
+    def open_edit_message(self,room,text):
+        win=ctk.CTkToplevel(self); win.title('EDIT MESSAGE'); win.geometry('500x190'); win.configure(fg_color=BG_ROOT)
+        e=ctk.CTkEntry(win,width=400,height=40); e.insert(0,text); e.pack(pady=25)
+        def save():
+            import hashlib as _h; key=_h.sha1(f'{room}|{text}'.encode()).hexdigest()[:12]
+            try:self.client_socket.sendall(f'EDIT:{room}:{key}:{e.get()}\n'.encode())
+            except Exception:pass
+            win.destroy()
+        ctk.CTkButton(win,text='SAVE EDIT',command=save,fg_color=FG_DIM,text_color='black').pack()
+    def refresh_channel_buttons(self):
+        # Keep the first two controls and add dynamic channels below them.
+        for w in getattr(self,'dynamic_channel_buttons',[]):
+            try:w.destroy()
+            except:pass
+        self.dynamic_channel_buttons=[]
+        for ch in self.server_channels[2:]:
+            b=ctk.CTkButton(self.sidebar_body,text=f'# {ch}',font=(FONT_MONO,11,'bold'),fg_color=BTN_BG,hover_color=BTN_HOVER,text_color=FG_BRIGHT,height=30,corner_radius=0,command=lambda x=ch:self.select_channel(x)); b.pack(fill='x',padx=8,pady=2); self.dynamic_channel_buttons.append(b)
+    def receive_file(self,room,sender,name,b64):
         try:
-            self.client_socket.sendall(network_payload.encode('utf-8'))
-        except Exception as e:
-            self.append_system_error(f"Message delivery lost: {e}")
+            raw=base64.b64decode(b64); path=os.path.join(CONFIG_DIR,'downloads'); os.makedirs(path,exist_ok=True); safe=re.sub(r'[^A-Za-z0-9._-]','_',name); full=os.path.join(path,safe)
+            with open(full,'wb') as f:f.write(raw)
+            self.store_and_render(room,sender,f'📎 {safe} saved to {full}')
+        except Exception as e:self.append_system_error(f'File receive failed: {e}')
 
     # ---------- Voice chat ----------
 
@@ -937,7 +1435,7 @@ class FullDiscordClone(ctk.CTk):
             self.voice_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.voice_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
             self.voice_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
-            self.voice_socket.sendto(f"REGISTER:{username}".encode('utf-8'), (HOST, VOICE_PORT))
+            self.voice_socket.sendto(f"REGISTER:{username}".encode('utf-8'), (self.server_host, self.voice_port if hasattr(self,"voice_port") else VOICE_PORT))
 
             input_device = self.voice_device_input
             output_device = self.voice_device_output
@@ -1010,7 +1508,7 @@ class FullDiscordClone(ctk.CTk):
                     data = b"\x00" * len(data)
                 # Convert device-native PCM to NETRA's fixed 16 kHz network format.
                 network_data = resample_pcm16_mono(bytes(data), self.voice_input_rate, VOICE_RATE)
-                self.voice_socket.sendto(network_data, (HOST, VOICE_PORT))
+                self.voice_socket.sendto(network_data, (self.server_host, self.voice_port if hasattr(self,"voice_port") else VOICE_PORT))
             except Exception:
                 break
 
@@ -1049,7 +1547,7 @@ class FullDiscordClone(ctk.CTk):
         username = self.username_entry.get().strip()
         try:
             if self.voice_socket and username:
-                self.voice_socket.sendto(f"UNREGISTER:{username}".encode('utf-8'), (HOST, VOICE_PORT))
+                self.voice_socket.sendto(f"UNREGISTER:{username}".encode('utf-8'), (self.server_host, self.voice_port if hasattr(self,"voice_port") else VOICE_PORT))
         except Exception:
             pass
         for stream in (self.voice_input_stream, self.voice_output_stream):
