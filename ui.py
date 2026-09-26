@@ -11,6 +11,8 @@ import subprocess
 import base64
 import json
 import re
+import queue
+import time
 import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image
@@ -297,7 +299,10 @@ class FullDiscordClone(ctk.CTk):
         self.dm_list_buttons = {}
         self.last_dm_partners = None
         self.last_user_list = []
+        self.last_registered_user_list = []
         self.online_user_set = set()
+        self._incoming_queue = queue.Queue()
+        self.last_server_message_time = 0.0
         self.last_voice_user_list = []
         self.sidebar_mode = "server"  # "server" or "dms"
         self.server_channels = ["general-chat", "random"]
@@ -412,10 +417,15 @@ class FullDiscordClone(ctk.CTk):
         self.voice_user_frame.pack(fill="x")
         self.update_voice_users_ui([])
 
-        self.member_header = ctk.CTkLabel(self.member_sidebar, text="ONLINE USERS", font=(FONT_MONO, 10, "bold"), text_color=FG_DIM)
+        self.member_header = ctk.CTkLabel(self.member_sidebar, text="MEMBERS", font=(FONT_MONO, 10, "bold"), text_color=FG_DIM)
         self.member_header.pack(padx=15, pady=(15, 5), anchor="w")
 
-        self.user_list_frame = ctk.CTkFrame(self.member_sidebar, fg_color="transparent")
+        self.member_search_var = ctk.StringVar(value="")
+        self.member_search = ctk.CTkEntry(self.member_sidebar, textvariable=self.member_search_var, placeholder_text="Find a member...", height=28, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, placeholder_text_color=FG_FAINT, font=(FONT_MONO, 9))
+        self.member_search.pack(fill="x", padx=10, pady=(0, 6))
+        self.member_search_var.trace_add("write", lambda *_: self.update_online_users_ui(self.last_registered_user_list, force=True))
+
+        self.user_list_frame = ctk.CTkScrollableFrame(self.member_sidebar, fg_color="transparent", corner_radius=0)
         self.user_list_frame.pack(fill="both", expand=True)
 
         # ---------------- Central Message Arena ----------------
@@ -459,12 +469,17 @@ class FullDiscordClone(ctk.CTk):
 
         self.show_server_view()
 
+        self.after(20, self._pump_incoming_messages)
         self.after(250, self.open_auth_window)
+        self.bind("<Control-f>", lambda _e: self.open_search())
+        self.bind("<Control-k>", lambda _e: self.member_search.focus_set())
+        self.bind("<Escape>", lambda _e: self.message_entry.focus_set())
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def select_channel(self, channel):
         if channel not in self.server_channels:
             return
+        self._save_current_draft()
         self.sidebar_mode = "server"
         self.current_target = channel
         self.unread_counts[channel]=0
@@ -473,6 +488,8 @@ class FullDiscordClone(ctk.CTk):
         self.random_channel_btn.configure(fg_color=BTN_HOVER if channel == "random" else BTN_BG)
         self.show_chat_room(channel)
         self.update_input_placeholder()
+        self._restore_current_draft()
+        self._refresh_unread_badges()
 
     def connect_to_server_from_bar(self):
         host = self.server_ip_entry.get().strip()
@@ -553,7 +570,7 @@ class FullDiscordClone(ctk.CTk):
         for user in partners_tuple:
             avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
             btn = ctk.CTkButton(
-                self.dm_list_frame, image=avatar_img, text=f"  {user}",
+                self.dm_list_frame, image=avatar_img, text=f"  {user}" + (f"  [{self.unread_counts.get(user,0)}]" if self.unread_counts.get(user,0) else ""),
                 compound="left", font=(FONT_MONO, 12, "bold"),
                 corner_radius=0,
                 fg_color=(BTN_HOVER if user == self.current_target else "transparent"),
@@ -1146,20 +1163,40 @@ class FullDiscordClone(ctk.CTk):
         self.auth_waiting = False
 
     def receive_messages_loop(self):
+        """Socket reader. It never touches Tk widgets directly."""
         buffer = ""
         while True:
             try:
                 data = self.client_socket.recv(65536)
                 if not data:
                     break
-                buffer += data.decode('utf-8')
+                buffer += data.decode("utf-8", errors="replace")
                 while "\n" in buffer:
                     raw_message, buffer = buffer.split("\n", 1)
-                    if not raw_message:
-                        continue
-                    self.handle_incoming_line(raw_message)
-            except:
+                    if raw_message:
+                        self._incoming_queue.put(raw_message)
+                        self.last_server_message_time = time.monotonic()
+            except Exception:
                 break
+        self._incoming_queue.put("__NETRA_DISCONNECTED__")
+
+    def _pump_incoming_messages(self):
+        """Process a bounded packet batch so large histories do not freeze the UI."""
+        processed = 0
+        while processed < 60:
+            try:
+                raw = self._incoming_queue.get_nowait()
+            except queue.Empty:
+                break
+            if raw == "__NETRA_DISCONNECTED__":
+                self.server_status_label.configure(text="disconnected", text_color=ERROR_RED)
+            else:
+                try:
+                    self.handle_incoming_line(raw)
+                except Exception as exc:
+                    self.append_system_error(f"NETRA packet error: {exc}")
+            processed += 1
+        self.after(20, self._pump_incoming_messages)
 
     def handle_incoming_line(self, raw_message):
         my_name = self.username_entry.get().strip()
@@ -1286,8 +1323,8 @@ class FullDiscordClone(ctk.CTk):
             p=raw_message.split(':',2)
             if len(p)==3 and p[1]!=my_name:
                 self.typing_users[p[2]]=p[1]
-                self.after(0,self.server_status_label.configure,text=f"{p[1]} is typing...")
-                self.after(1500,lambda:self.server_status_label.configure(text='connected'))
+                self.server_status_label.configure(text=f"{p[1]} is typing...", text_color=FG_DIM)
+                self.after(1500,lambda:self.server_status_label.configure(text="connected", text_color=FG_DIM))
         elif raw_message.startswith("REACTION:"):
             p=raw_message.split(':',4)
             if len(p)==5: self.reactions.setdefault(p[1],{}).setdefault(p[2],[]).append(f'{p[3]}:{p[4]}')
@@ -1360,6 +1397,7 @@ class FullDiscordClone(ctk.CTk):
 
         if self.sidebar_mode == "dms" and chat_room not in self.server_channels and not self.loading_history:
             self.refresh_dm_list()
+        self._refresh_unread_badges()
 
     def update_voice_users_ui(self, user_list):
         normalized = list(dict.fromkeys(user_list))
@@ -1381,46 +1419,27 @@ class FullDiscordClone(ctk.CTk):
 
     def update_online_presence_ui(self, user_list):
         self.online_user_set = set(user_list)
-        self.update_online_users_ui(self.last_user_list, force=True)
+        self.update_online_users_ui(self.last_registered_user_list or self.last_user_list, force=True)
 
     def update_online_users_ui(self, user_list, force=False):
-        # USERS is the persistent account list so offline users can still be
-        # selected for DMs.  This panel is specifically ONLINE USERS, though,
-        # so only names from the current ONLINE list belong here.
-        normalized = list(dict.fromkeys(user_list))
-        if normalized == self.last_user_list and not force:
-            return
+        """Show every registered account with a live online/offline indicator."""
+        normalized = sorted(list(dict.fromkeys([u for u in user_list if u])), key=str.lower)
+        self.last_registered_user_list = normalized
         self.last_user_list = normalized
+        search = self.member_search_var.get().strip().casefold() if hasattr(self, "member_search_var") else ""
+        my_name = self.username_entry.get().strip()
+        visible = [u for u in normalized if u != my_name and (not search or search in u.casefold())]
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
-
-        my_name = self.username_entry.get().strip()
-        online_users = sorted(
-            (u for u in normalized if u in self.online_user_set and u != my_name),
-            key=str.lower,
-        )
-
-        if not online_users:
-            empty = ctk.CTkLabel(
-                self.user_list_frame,
-                text="No other users online",
-                font=(FONT_MONO, 10),
-                text_color=FG_FAINT,
-                anchor="w",
-            )
-            empty.pack(fill="x", padx=10, pady=4)
+        if not visible:
+            ctk.CTkLabel(self.user_list_frame, text="No matching members" if search else "No other members", font=(FONT_MONO, 10), text_color=FG_FAINT, anchor="w").pack(fill="x", padx=8, pady=8)
         else:
-            for user in online_users:
+            for user in visible:
+                online = user in self.online_user_set
+                status = "●" if online else "○"
                 avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
-                btn = ctk.CTkButton(
-                    self.user_list_frame, image=avatar_img,
-                    text=f"  ● {user}", compound="left",
-                    font=(FONT_MONO, 12, "bold"), corner_radius=0,
-                    fg_color="transparent", text_color=FG_BRIGHT,
-                    anchor="w", height=32, hover_color=BTN_HOVER,
-                    command=lambda u=user: self.select_dm_channel(u))
-                btn.pack(fill="x", padx=10, pady=2)
-
+                btn = ctk.CTkButton(self.user_list_frame, image=avatar_img, text=f"  {status} {user}", compound="left", font=(FONT_MONO, 10, "bold"), corner_radius=0, fg_color=(BTN_HOVER if user == self.current_target else "transparent"), text_color=(FG_BRIGHT if online else FG_DIM), anchor="w", height=34, hover_color=BTN_HOVER, command=lambda u=user: self.select_dm_channel(u))
+                btn.pack(fill="x", padx=4, pady=1)
         if self.sidebar_mode == "dms":
             self.refresh_dm_list()
 
@@ -1430,6 +1449,7 @@ class FullDiscordClone(ctk.CTk):
     def select_dm_channel(self, username):
         if not username or username == self.username_entry.get().strip():
             return
+        self._save_current_draft()
         already_selected = (self.current_target == username and self.sidebar_mode == "dms")
         self.current_target = username
         self.unread_counts[username]=0
@@ -1440,6 +1460,8 @@ class FullDiscordClone(ctk.CTk):
             self.refresh_dm_list()
             if not already_selected:
                 self.show_chat_room(username)
+        self._restore_current_draft()
+        self._refresh_unread_badges()
 
     def get_chat_room_frame(self, room):
         frame = self.chat_room_frames.get(room)
@@ -1529,11 +1551,12 @@ class FullDiscordClone(ctk.CTk):
         else: payload=f"DM:{self.current_target}:{message}\n"
         try: self.client_socket.sendall(payload.encode('utf-8'))
         except Exception as e: self.append_system_error(f"Message delivery lost: {e}")
+        self._refresh_unread_badges()
 
     def open_netra_hub(self):
         win=ctk.CTkToplevel(self); win.title('NETRA // HUB'); win.geometry('520x620'); win.configure(fg_color=BG_ROOT); win.transient(self)
         ctk.CTkLabel(win,text='NETRA // FEATURES',font=(FONT_MONO,20,'bold'),text_color=FG_BRIGHT).pack(pady=(20,10))
-        items=[('👤 PROFILE',self.open_profile),('🟢 PRESENCE / STATUS',self.open_status),('⭐ FAVORITES',self.open_favorites),('🔔 NOTIFICATIONS',self.open_notifications),('📌 PINNED MESSAGES',self.open_pins),('🎨 THEMES',self.open_themes),('🛡️ SERVER / CHANNEL TOOLS',self.open_channel_tools)]
+        items=[('👤 PROFILE',self.open_profile),('🟢 PRESENCE / STATUS',self.open_status),('⭐ FAVORITES',self.open_favorites),('🔔 NOTIFICATIONS',self.open_notifications),('📌 PINNED MESSAGES',self.open_pins),('🔎 SEARCH MESSAGES',self.open_search),('🌐 SERVER BROWSER',self.open_server_browser),('🎨 THEMES',self.open_themes),('🛡️ SERVER / CHANNEL TOOLS',self.open_channel_tools)]
         for text,cmd in items: ctk.CTkButton(win,text=text,command=cmd,height=38,corner_radius=0,fg_color=BTN_BG,hover_color=BTN_HOVER,text_color=FG_BRIGHT,font=(FONT_MONO,11,'bold')).pack(fill='x',padx=35,pady=5)
         ctk.CTkLabel(win,text='Right-click messages for reply / edit / delete / react / pin.',font=(FONT_MONO,9),text_color=FG_FAINT).pack(pady=18)
 
