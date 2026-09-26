@@ -24,6 +24,7 @@ accounts = {}
 username_map = {}
 servers = {}
 clients = {}              # username -> socket
+client_send_locks = {}     # socket -> Lock, prevents line interleaving on shared TCP connections
 clients_lock = threading.RLock()
 voice_users = set()
 voice_lock = threading.RLock()
@@ -140,25 +141,28 @@ def auth(action, name, password):
 
 
 def send_line(conn, line):
+    data = (line.rstrip("\n") + "\n").encode("utf-8")
     try:
-        conn.sendall((line.rstrip("\n") + "\n").encode("utf-8"))
+        with clients_lock:
+            lock_for_conn = client_send_locks.get(conn)
+        if lock_for_conn is None:
+            conn.sendall(data)
+        else:
+            with lock_for_conn:
+                conn.sendall(data)
         return True
     except Exception:
         return False
 
 
 def broadcast(line):
-    encoded = (line.rstrip("\n") + "\n").encode("utf-8")
     with clients_lock:
         targets = list(clients.values())
     dead = []
     for conn in targets:
-        try:
-            conn.sendall(encoded)
-        except Exception:
+        if not send_line(conn, line):
             dead.append(conn)
     return dead
-
 
 def dm_key(a, b):
     return "|".join(sorted([a, b], key=str.casefold))
@@ -274,12 +278,9 @@ def handle_line(conn, username, line):
             targets = [(name, peer) for name, peer in clients.items()
                        if name != username and name in voice_targets]
 
-        packet = f"VOICE:{username}:{encoded_audio}\n".encode("ascii", "ignore")
+        packet = f"VOICE:{username}:{encoded_audio}"
         for target_name, peer in targets:
-            try:
-                peer.sendall(packet)
-            except OSError:
-                pass
+            send_line(peer, packet)
         return username
 
     if line.startswith("PFP:"):
@@ -427,6 +428,8 @@ def handle(conn, addr):
                 send_presence_lists()
             if was_voice:
                 send_voice_list()
+        with clients_lock:
+            client_send_locks.pop(conn, None)
         try:
             conn.close()
         except Exception:
@@ -487,4 +490,11 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
     server.listen(100)
     while True:
         conn, addr = server.accept()
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+        with clients_lock:
+            client_send_locks[conn] = threading.RLock()
         threading.Thread(target=handle, args=(conn, addr), daemon=True).start()

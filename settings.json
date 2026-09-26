@@ -1,7 +1,18 @@
 {
-  "dm_sound_mode": "ping_4",
+  "theme": "Sakura",
+  "dm_sound_mode": "ping_5",
   "dm_sound_path": "C:/Users/Leo/Downloads/oxp.wav",
   "voice_input_device": 1,
   "voice_output_device": 7,
-  "theme": "CRT Amber"
+  "voice_volume": 1.25,
+  "voice_mic_gain": 1.0,
+  "voice_quality": "High",
+  "voice_noise_gate": true,
+  "voice_agc": true,
+  "voice_echo_guard": true,
+  "voice_deafen": false,
+  "voice_ptt": false,
+  "voice_record": false,
+  "voice_user_volumes": {},
+  "voice_user_mutes": {}
 }
