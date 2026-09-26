@@ -102,6 +102,15 @@ class FullDiscordClone(ctk.CTk):
         self.voice_socket = None
         self.voice_input_stream = None
         self.voice_output_stream = None
+        self.voice_device_input = None
+        self.voice_device_output = None
+        self.voice_muted = False
+        self.dm_sound_mode = os.getenv("DM_SOUND", "ping")
+        self.dm_sound_path = os.getenv("DM_SOUND_PATH", "")
+        self.voice_device_input = os.getenv("VOICE_INPUT_DEVICE", "") or None
+        self.voice_device_output = os.getenv("VOICE_OUTPUT_DEVICE", "") or None
+        self.loading_history = True
+        self._history_ready = False
 
         # ---------------- Server Navigation Rail ----------------
         self.server_rail = ctk.CTkFrame(self, width=70, corner_radius=0, fg_color=BG_RAIL)
@@ -127,6 +136,7 @@ class FullDiscordClone(ctk.CTk):
 
         self.channel_btn = ctk.CTkButton(self.sidebar_body, text="# general-chat", font=(FONT_MONO, 12, "bold"), fg_color=BTN_HOVER, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=self.go_to_server_view)
         self.voice_btn = ctk.CTkButton(self.sidebar_body, text="🎤 Join Voice", font=(FONT_MONO, 12, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=self.toggle_voice_chat)
+        self.voice_mute_btn = ctk.CTkButton(self.sidebar_body, text="🔇 Mute Mic", font=(FONT_MONO, 11, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=28, corner_radius=0, command=self.toggle_voice_mute)
         self.dm_list_frame = ctk.CTkFrame(self.sidebar_body, fg_color="transparent", corner_radius=0)
 
         # Profile Picture & Username Panel
@@ -146,6 +156,13 @@ class FullDiscordClone(ctk.CTk):
         self.username_entry.insert(0, saved_user)
         self.username_entry.pack(pady=(0, 12), padx=15)
         self.username_entry.bind("<Return>", lambda event: self.connect_and_auth())
+
+        self.settings_btn = ctk.CTkButton(
+            self.user_section, text="⚙ SETTINGS", font=(FONT_MONO, 10, "bold"),
+            fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT,
+            height=24, width=120, corner_radius=0, command=self.open_settings
+        )
+        self.settings_btn.pack(pady=(0, 8))
 
         # ---------------- Right Active User Panel ----------------
         self.member_sidebar = ctk.CTkFrame(self, width=180, corner_radius=0, fg_color=BG_PANEL)
@@ -201,13 +218,15 @@ class FullDiscordClone(ctk.CTk):
         self.server_title.configure(text="Main Server")
         self.dm_list_frame.pack_forget()
         self.channel_btn.pack(fill="x", padx=10, pady=5)
-        self.voice_btn.pack(fill="x", padx=10, pady=(0, 5))
+        self.voice_btn.pack(fill="x", padx=10, pady=(0, 2))
+        self.voice_mute_btn.pack(fill="x", padx=10, pady=(0, 5))
 
     def show_dm_view(self):
         self.sidebar_mode = "dms"
         self.server_title.configure(text="Direct Messages")
         self.channel_btn.pack_forget()
         self.voice_btn.pack_forget()
+        self.voice_mute_btn.pack_forget()
 
         if self.current_target == "GLOBAL":
             candidates = sorted(set(self.chat_history.keys()) - {"GLOBAL"})
@@ -347,18 +366,134 @@ class FullDiscordClone(ctk.CTk):
 
     # ---------- Sound ----------
 
-    def play_ping_sound(self):
+    def _save_setting(self, key, value):
         try:
-            path = generate_ping_wav()
-            if os.name == 'nt':
+            if not os.path.exists(ENV_FILE):
+                open(ENV_FILE, "w").close()
+            set_key(ENV_FILE, key, str(value))
+            os.environ[key] = str(value)
+        except Exception as e:
+            self.append_system_error(f"Could not save setting: {e}")
+
+    def play_ping_sound(self):
+        """Play the configured DM notification sound without blocking the UI."""
+        if self.dm_sound_mode == "off":
+            return
+        try:
+            if self.dm_sound_mode == "custom" and self.dm_sound_path and os.path.exists(self.dm_sound_path):
+                path = self.dm_sound_path
+            else:
+                path = generate_ping_wav()
+            if os.name == "nt":
                 import winsound
                 winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['afplay', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
-                subprocess.Popen(['aplay', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(["aplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
+
+    def open_settings(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Settings")
+        win.geometry("520x430")
+        win.resizable(False, False)
+        win.configure(fg_color=BG_ROOT)
+        win.transient(self)
+        win.grab_set()
+
+        title = ctk.CTkLabel(win, text="CLIENT SETTINGS", font=(FONT_MONO, 16, "bold"), text_color=FG_BRIGHT)
+        title.pack(pady=(18, 12))
+
+        # DM notification sound
+        sound_frame = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=0)
+        sound_frame.pack(fill="x", padx=20, pady=8)
+        ctk.CTkLabel(sound_frame, text="DM notification sound", font=(FONT_MONO, 11, "bold"),
+                     text_color=FG_BRIGHT).pack(anchor="w", padx=12, pady=(10, 4))
+        sound_var = ctk.StringVar(value=self.dm_sound_mode)
+        sound_menu = ctk.CTkOptionMenu(
+            sound_frame, variable=sound_var,
+            values=["ping", "custom", "off"], width=180,
+            fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER,
+            text_color=FG_BRIGHT, font=(FONT_MONO, 10)
+        )
+        sound_menu.pack(anchor="w", padx=12, pady=(0, 8))
+        sound_path_label = ctk.CTkLabel(sound_frame, text=self.dm_sound_path or "No custom sound selected",
+                                        font=(FONT_MONO, 9), text_color=FG_FAINT)
+        sound_path_label.pack(anchor="w", padx=12, pady=(0, 8))
+
+        def choose_sound():
+            path = filedialog.askopenfilename(
+                title="Choose DM notification sound",
+                filetypes=[("WAV audio", "*.wav"), ("Audio files", "*.wav *.mp3 *.ogg"), ("All files", "*.*")]
+            )
+            if path:
+                self.dm_sound_path = path
+                self.dm_sound_mode = "custom"
+                sound_var.set("custom")
+                sound_path_label.configure(text=path)
+
+        ctk.CTkButton(sound_frame, text="CHOOSE WAV", command=choose_sound,
+                      width=120, height=28, corner_radius=0, fg_color=BTN_BG,
+                      hover_color=BTN_HOVER, text_color=FG_BRIGHT,
+                      font=(FONT_MONO, 10, "bold")).pack(anchor="w", padx=12, pady=(0, 10))
+
+        # Voice devices
+        voice_frame = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=0)
+        voice_frame.pack(fill="x", padx=20, pady=8)
+        ctk.CTkLabel(voice_frame, text="VOICE DEVICES", font=(FONT_MONO, 11, "bold"),
+                     text_color=FG_BRIGHT).pack(anchor="w", padx=12, pady=(10, 6))
+
+        input_names, output_names = self.get_audio_device_names()
+        input_values = ["Default"] + input_names
+        output_values = ["Default"] + output_names
+        input_var = ctk.StringVar(value=self.voice_device_input or "Default")
+        output_var = ctk.StringVar(value=self.voice_device_output or "Default")
+
+        ctk.CTkLabel(voice_frame, text="Microphone", font=(FONT_MONO, 9), text_color=FG_DIM).pack(anchor="w", padx=12)
+        input_menu = ctk.CTkOptionMenu(voice_frame, variable=input_var, values=input_values, width=440,
+                                       fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER,
+                                       text_color=FG_BRIGHT, font=(FONT_MONO, 9))
+        input_menu.pack(padx=12, pady=(2, 7))
+        ctk.CTkLabel(voice_frame, text="Output / speakers", font=(FONT_MONO, 9), text_color=FG_DIM).pack(anchor="w", padx=12)
+        output_menu = ctk.CTkOptionMenu(voice_frame, variable=output_var, values=output_values, width=440,
+                                        fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER,
+                                        text_color=FG_BRIGHT, font=(FONT_MONO, 9))
+        output_menu.pack(padx=12, pady=(2, 10))
+
+        def save_and_close():
+            self.dm_sound_mode = sound_var.get()
+            self.voice_device_input = None if input_var.get() == "Default" else input_var.get()
+            self.voice_device_output = None if output_var.get() == "Default" else output_var.get()
+            self._save_setting("DM_SOUND", self.dm_sound_mode)
+            self._save_setting("DM_SOUND_PATH", self.dm_sound_path)
+            self._save_setting("VOICE_INPUT_DEVICE", self.voice_device_input or "")
+            self._save_setting("VOICE_OUTPUT_DEVICE", self.voice_device_output or "")
+            win.destroy()
+
+        ctk.CTkButton(win, text="SAVE", command=save_and_close, width=150, height=34,
+                      corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER,
+                      text_color="black", font=(FONT_MONO, 11, "bold")).pack(pady=12)
+
+    def get_audio_device_names(self):
+        if not SOUNDDEVICE_AVAILABLE:
+            return [], []
+        try:
+            devices = sd.query_devices()
+            inputs = []
+            outputs = []
+            for d in devices:
+                name = str(d.get("name", "")).strip()
+                if not name:
+                    continue
+                if int(d.get("max_input_channels", 0)) > 0 and name not in inputs:
+                    inputs.append(name)
+                if int(d.get("max_output_channels", 0)) > 0 and name not in outputs:
+                    outputs.append(name)
+            return inputs, outputs
+        except Exception:
+            return [], []
 
     # ---------- Networking ----------
 
@@ -381,6 +516,8 @@ class FullDiscordClone(ctk.CTk):
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((HOST, PORT))
+            self.loading_history = True
+            self._history_ready = False
             self.client_socket.sendall(f"AUTH:{username}\n".encode('utf-8'))
             self.user_pil_pfps[username] = self.pil_pfp
             self.send_own_pfp()
@@ -433,13 +570,18 @@ class FullDiscordClone(ctk.CTk):
                 if sender != my_name:
                     self.play_ping_sound()
         elif raw_message.startswith("DM:"):
-            parts = raw_message.split(":", 2)
-            if len(parts) == 3:
-                sender, text = parts[1], parts[2]
-                chat_room = sender if sender != my_name else self.current_target
+            # DM:<room_partner>:<actual_sender>:<text>
+            parts = raw_message.split(":", 3)
+            if len(parts) == 4:
+                chat_room, sender, text = parts[1], parts[2], parts[3]
                 self.after(0, self.store_and_render, chat_room, sender, text)
                 if sender != my_name:
                     self.play_ping_sound()
+        elif raw_message == "READY":
+            self.loading_history = False
+            self._history_ready = True
+            self.after(0, self.refresh_dm_list)
+            self.after(0, self.reload_current_chat_view)
         elif raw_message.startswith("SERVERPFP:"):
             b64_data = raw_message.split(":", 1)[1]
             self.after(0, self.receive_server_icon, b64_data)
@@ -476,14 +618,17 @@ class FullDiscordClone(ctk.CTk):
         msg_data = {"sender": sender, "text": text}
         self.chat_history[chat_room].append(msg_data)
 
-        if self.current_target == chat_room:
+        if self.current_target == chat_room and not self.loading_history:
             self.render_single_message(sender, text)
 
-        if self.sidebar_mode == "dms" and chat_room != "GLOBAL":
+        if self.sidebar_mode == "dms" and chat_room != "GLOBAL" and not self.loading_history:
             self.refresh_dm_list()
 
     def update_voice_users_ui(self, user_list):
-        self.last_voice_user_list = user_list
+        normalized = list(dict.fromkeys(user_list))
+        if normalized == self.last_voice_user_list:
+            return
+        self.last_voice_user_list = normalized
         for widget in self.voice_user_frame.winfo_children():
             widget.destroy()
 
@@ -498,7 +643,10 @@ class FullDiscordClone(ctk.CTk):
             row.pack(fill="x", padx=10, pady=2)
 
     def update_online_users_ui(self, user_list):
-        self.last_user_list = user_list
+        normalized = list(dict.fromkeys(user_list))
+        if normalized == self.last_user_list:
+            return
+        self.last_user_list = normalized
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
 
@@ -597,13 +745,19 @@ class FullDiscordClone(ctk.CTk):
             return
         try:
             self.voice_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.voice_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+            self.voice_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
             self.voice_socket.sendto(f"REGISTER:{username}".encode('utf-8'), (HOST, VOICE_PORT))
 
+            input_device = self.voice_device_input or None
+            output_device = self.voice_device_output or None
             self.voice_input_stream = sd.RawInputStream(
-                samplerate=VOICE_RATE, blocksize=VOICE_CHUNK, dtype='int16', channels=VOICE_CHANNELS)
+                samplerate=VOICE_RATE, blocksize=VOICE_CHUNK, dtype='int16',
+                channels=VOICE_CHANNELS, device=input_device, latency="low")
             self.voice_input_stream.start()
             self.voice_output_stream = sd.RawOutputStream(
-                samplerate=VOICE_RATE, blocksize=VOICE_CHUNK, dtype='int16', channels=VOICE_CHANNELS)
+                samplerate=VOICE_RATE, blocksize=VOICE_CHUNK, dtype='int16',
+                channels=VOICE_CHANNELS, device=output_device, latency="low")
             self.voice_output_stream.start()
 
             self.in_voice_chat = True
@@ -626,6 +780,8 @@ class FullDiscordClone(ctk.CTk):
         while self.in_voice_chat:
             try:
                 data, overflowed = self.voice_input_stream.read(VOICE_CHUNK)
+                if self.voice_muted:
+                    data = b"\x00" * len(data)
                 self.voice_socket.sendto(bytes(data), (HOST, VOICE_PORT))
             except Exception:
                 break
@@ -644,6 +800,13 @@ class FullDiscordClone(ctk.CTk):
                 continue
             except Exception:
                 break
+
+    def toggle_voice_mute(self):
+        self.voice_muted = not self.voice_muted
+        if self.voice_muted:
+            self.voice_mute_btn.configure(text="🎤 Unmute Mic", fg_color=BTN_ACTIVE_BG, text_color="black")
+        else:
+            self.voice_mute_btn.configure(text="🔇 Mute Mic", fg_color=BTN_BG, text_color=FG_BRIGHT)
 
     def stop_voice_chat(self):
         self.in_voice_chat = False

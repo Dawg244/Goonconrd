@@ -25,6 +25,18 @@ voice_clients = {}   # addr -> username
 voice_lock = threading.Lock()
 
 log_lock = threading.Lock()
+save_timer = None
+save_timer_lock = threading.Lock()
+
+
+def schedule_log_save():
+    global save_timer
+    with save_timer_lock:
+        if save_timer is not None and save_timer.is_alive():
+            return
+        save_timer = threading.Timer(0.75, save_message_log)
+        save_timer.daemon = True
+        save_timer.start()
 
 
 def load_message_log():
@@ -135,6 +147,13 @@ def process_line(message, username, connection, address):
                 except Exception:
                     pass
 
+        # Signal that history is complete. The client waits for this before
+        # building hundreds of GUI widgets, which keeps login/startup responsive.
+        try:
+            connection.sendall(b"READY\n")
+        except Exception:
+            pass
+
         # ...then catch the new client up on everyone's current pfp...
         for other_user, b64 in existing_pfps.items():
             try:
@@ -160,7 +179,7 @@ def process_line(message, username, connection, address):
         with log_lock:
             message_log["global"].append({"sender": username, "text": payload})
             message_log["global"] = message_log["global"][-MAX_HISTORY_PER_CHANNEL:]
-            save_message_log()
+            schedule_log_save()
         broadcast(f"GLOBAL:{username}:{payload}\n")
 
     elif message.startswith("DM:"):
@@ -173,19 +192,19 @@ def process_line(message, username, connection, address):
                 key = dm_key(username, target_user)
                 message_log["dms"].setdefault(key, []).append({"sender": username, "text": payload})
                 message_log["dms"][key] = message_log["dms"][key][-MAX_HISTORY_PER_CHANNEL:]
-                save_message_log()
+                schedule_log_save()
 
             with clients_lock:
                 target_conn = clients.get(target_user)
                 self_conn = clients.get(username)
             if target_conn:
                 try:
-                    target_conn.sendall(f"DM:{username}:{payload}\n".encode('utf-8'))
+                    target_conn.sendall(f"DM:{username}:{username}:{payload}\n".encode('utf-8'))
                 except Exception:
                     pass
             if self_conn:
                 try:
-                    self_conn.sendall(f"DM:{target_user}:{payload}\n".encode('utf-8'))
+                    self_conn.sendall(f"DM:{target_user}:{username}:{payload}\n".encode('utf-8'))
                 except Exception:
                     pass
 
@@ -232,14 +251,14 @@ def broadcast(message_str):
 def broadcast_user_list():
     with clients_lock:
         names = list(clients.keys())
-    user_list_str = "USERS:" + ",".join(names) + "\n"
+    user_list_str = "USERS:" + ",".join(sorted(names)) + "\n"
     broadcast(user_list_str)
 
 
 def broadcast_voice_user_list():
     with presence_lock:
         names = list(voice_presence_users)
-    voice_list_str = "VOICEUSERS:" + ",".join(names) + "\n"
+    voice_list_str = "VOICEUSERS:" + ",".join(sorted(names)) + "\n"
     broadcast(voice_list_str)
 
 
