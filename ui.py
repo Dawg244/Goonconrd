@@ -1,3 +1,4 @@
+import tkinter
 import socket
 import threading
 import os
@@ -490,6 +491,56 @@ class FullDiscordClone(ctk.CTk):
         self.update_input_placeholder()
         self._restore_current_draft()
         self._refresh_unread_badges()
+
+
+    # ---------- Drafts / unread badges ----------
+
+    def _save_current_draft(self):
+        """Save the text currently in the composer for the active room."""
+        try:
+            text = self.message_entry.get()
+        except Exception:
+            return
+        if text:
+            self.draft_messages[self.current_target] = text
+        else:
+            self.draft_messages.pop(self.current_target, None)
+
+    def _restore_current_draft(self):
+        """Restore the draft for the room we just switched to."""
+        try:
+            self.message_entry.delete(0, "end")
+            draft = self.draft_messages.get(self.current_target, "")
+            if draft:
+                self.message_entry.insert(0, draft)
+        except Exception:
+            pass
+
+    def _refresh_unread_badges(self):
+        """Refresh channel/DM unread counters without rebuilding the chat UI."""
+        try:
+            general_count = int(self.unread_counts.get("general-chat", 0) or 0)
+            random_count = int(self.unread_counts.get("random", 0) or 0)
+
+            self.channel_btn.configure(
+                text="# general-chat" + (f"  [{general_count}]" if general_count else "")
+            )
+            self.random_channel_btn.configure(
+                text="# random" + (f"  [{random_count}]" if random_count else "")
+            )
+
+            # DM buttons already contain their counts.  Update their text in
+            # place when possible so switching channels does not rebuild the
+            # entire sidebar and cause visible lag.
+            for user, button in list(getattr(self, "dm_list_buttons", {}).items()):
+                try:
+                    count = int(self.unread_counts.get(user, 0) or 0)
+                    button.configure(text=f"  {user}" + (f"  [{count}]" if count else ""))
+                except Exception:
+                    pass
+        except Exception:
+            # Badge updates are cosmetic; never let them break message sending.
+            pass
 
     def connect_to_server_from_bar(self):
         host = self.server_ip_entry.get().strip()
@@ -1064,9 +1115,17 @@ class FullDiscordClone(ctk.CTk):
             self.server_ip_entry.delete(0, "end")
             self.server_ip_entry.insert(0, f"{new_host}:{new_port}")
             self.server_ip_small.configure(text=f"{new_host}:{new_port}")
-            server_status.configure(text=f"Using {new_host}:{new_port}", text_color=FG_DIM)
-            if getattr(self, "_auth_status_label", None):
-                self._auth_status_label.configure(text="")
+            try:
+                if win.winfo_exists():
+                    server_status.configure(text=f"Using {new_host}:{new_port}", text_color=FG_DIM)
+            except (tkinter.TclError, Exception):
+                pass
+            try:
+                auth_status = getattr(self, "_auth_status_label", None)
+                if auth_status is not None and auth_status.winfo_exists():
+                    auth_status.configure(text="")
+            except (tkinter.TclError, Exception):
+                pass
 
         ctk.CTkButton(
             win, text="USE SERVER", width=145, height=32, corner_radius=0,
