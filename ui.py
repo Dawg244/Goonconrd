@@ -440,6 +440,9 @@ class FullDiscordClone(ctk.CTk):
         saved_user = os.getenv("CHAT_USERNAME", "User")
         self.username_entry = ctk.CTkEntry(self.user_section, width=140, height=28, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 11, "bold"), justify="center")
         self.username_entry.insert(0, saved_user)
+        # Keep the locally saved avatar associated with the remembered account.
+        if saved_user:
+            self.user_pil_pfps[saved_user] = self.pil_pfp
         self.username_entry.pack(pady=(0, 12), padx=15)
         self.username_entry.configure(state="disabled")
 
