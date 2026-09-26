@@ -1,17 +1,58 @@
 import socket
 import threading
+import os
+import json
 
 HOST = "0.0.0.0"
 PORT = 12145
 VOICE_PORT = 12146
+
+LOG_FILE = "chat_log.json"
+MAX_HISTORY_PER_CHANNEL = 200
 
 clients = {}        # username -> connection
 clients_pfp = {}     # username -> base64 png string (last known pfp)
 server_icon_b64 = None  # base64 png string for the shared "server" icon, or None
 clients_lock = threading.Lock()
 
+# "Who's in voice" for display purposes - driven over TCP so it doesn't
+# depend on UDP port forwarding being set up correctly.
+voice_presence_users = set()
+presence_lock = threading.Lock()
+
+# Actual audio relay bookkeeping (UDP) - separate from the display list above.
 voice_clients = {}   # addr -> username
 voice_lock = threading.Lock()
+
+log_lock = threading.Lock()
+
+
+def load_message_log():
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data.setdefault("global", [])
+                data.setdefault("dms", {})
+                return data
+        except Exception as e:
+            print(f"[WARN] Could not read {LOG_FILE}: {e}")
+    return {"global": [], "dms": {}}
+
+
+message_log = load_message_log()
+
+
+def save_message_log():
+    try:
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(message_log, f)
+    except Exception as e:
+        print(f"[ERROR] Could not save chat log: {e}")
+
+
+def dm_key(user_a, user_b):
+    return "|".join(sorted([user_a, user_b]))
 
 
 # ---------------- Text / chat TCP server ----------------
@@ -45,6 +86,20 @@ def handle_client(connection, address):
                     del clients[username]
             print(f"[DISCONNECT] {username} left.")
             broadcast_user_list()
+
+            # Clean up voice presence / stale audio registration for this user
+            removed_presence = False
+            with presence_lock:
+                if username in voice_presence_users:
+                    voice_presence_users.discard(username)
+                    removed_presence = True
+            if removed_presence:
+                broadcast_voice_user_list()
+
+            with voice_lock:
+                stale_addrs = [a for a, u in voice_clients.items() if u == username]
+                for a in stale_addrs:
+                    del voice_clients[a]
         connection.close()
 
 
@@ -57,25 +112,55 @@ def process_line(message, username, connection, address):
             clients[username] = connection
             existing_pfps = dict(clients_pfp)
             current_server_icon = server_icon_b64
+        with presence_lock:
+            current_voice_names = list(voice_presence_users)
+        with log_lock:
+            global_hist = list(message_log["global"])
+            dm_hist_items = [(k, list(v)) for k, v in message_log["dms"].items() if username in k.split("|")]
+
         print(f"[AUTH] {username} connected from {address}")
 
-        # Catch the new client up on everyone's current pfp...
+        # Replay chat history first...
+        for entry in global_hist:
+            try:
+                connection.sendall(f"HIST_GLOBAL:{entry['sender']}:{entry['text']}\n".encode('utf-8'))
+            except Exception:
+                pass
+        for key, entries in dm_hist_items:
+            parts = key.split("|")
+            partner = parts[0] if parts[1] == username else parts[1]
+            for entry in entries:
+                try:
+                    connection.sendall(f"HIST_DM:{partner}:{entry['sender']}:{entry['text']}\n".encode('utf-8'))
+                except Exception:
+                    pass
+
+        # ...then catch the new client up on everyone's current pfp...
         for other_user, b64 in existing_pfps.items():
             try:
                 connection.sendall(f"PFP:{other_user}:{b64}\n".encode('utf-8'))
             except Exception:
                 pass
-        # ...and the current shared server icon, if one has been set.
+        # ...the shared server icon, if set...
         if current_server_icon:
             try:
                 connection.sendall(f"SERVERPFP:{current_server_icon}\n".encode('utf-8'))
             except Exception:
                 pass
+        # ...and who's currently in voice.
+        try:
+            connection.sendall(("VOICEUSERS:" + ",".join(current_voice_names) + "\n").encode('utf-8'))
+        except Exception:
+            pass
 
         broadcast_user_list()
 
     elif message.startswith("GLOBAL:"):
         payload = message.split(":", 1)[1]
+        with log_lock:
+            message_log["global"].append({"sender": username, "text": payload})
+            message_log["global"] = message_log["global"][-MAX_HISTORY_PER_CHANNEL:]
+            save_message_log()
         broadcast(f"GLOBAL:{username}:{payload}\n")
 
     elif message.startswith("DM:"):
@@ -83,6 +168,13 @@ def process_line(message, username, connection, address):
         if len(parts) == 3:
             target_user = parts[1]
             payload = parts[2]
+
+            with log_lock:
+                key = dm_key(username, target_user)
+                message_log["dms"].setdefault(key, []).append({"sender": username, "text": payload})
+                message_log["dms"][key] = message_log["dms"][key][-MAX_HISTORY_PER_CHANNEL:]
+                save_message_log()
+
             with clients_lock:
                 target_conn = clients.get(target_user)
                 self_conn = clients.get(username)
@@ -98,7 +190,6 @@ def process_line(message, username, connection, address):
                     pass
 
     elif message.startswith("PFP:"):
-        # Client is uploading/updating their own profile picture.
         b64_payload = message.split(":", 1)[1]
         if username:
             with clients_lock:
@@ -106,11 +197,22 @@ def process_line(message, username, connection, address):
             broadcast(f"PFP:{username}:{b64_payload}\n")
 
     elif message.startswith("SERVERPFP:"):
-        # Client is uploading/updating the shared server icon.
         b64_payload = message.split(":", 1)[1]
         with clients_lock:
             server_icon_b64 = b64_payload
         broadcast(f"SERVERPFP:{b64_payload}\n")
+
+    elif message.startswith("VOICEJOIN:"):
+        if username:
+            with presence_lock:
+                voice_presence_users.add(username)
+            broadcast_voice_user_list()
+
+    elif message.startswith("VOICELEAVE:"):
+        if username:
+            with presence_lock:
+                voice_presence_users.discard(username)
+            broadcast_voice_user_list()
 
     return username
 
@@ -134,10 +236,14 @@ def broadcast_user_list():
     broadcast(user_list_str)
 
 
-# ---------------- Voice UDP relay ----------------
-# Very small "everyone hears everyone" relay: clients REGISTER their
-# address, then any audio packet coming from a known address gets
-# forwarded to every other known address. No mixing, no encoding.
+def broadcast_voice_user_list():
+    with presence_lock:
+        names = list(voice_presence_users)
+    voice_list_str = "VOICEUSERS:" + ",".join(names) + "\n"
+    broadcast(voice_list_str)
+
+
+# ---------------- Voice UDP relay (audio only, not presence) ----------------
 
 def voice_relay():
     voice_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -153,7 +259,7 @@ def voice_relay():
             username = data.split(b":", 1)[1].decode('utf-8', errors='ignore')
             with voice_lock:
                 voice_clients[addr] = username
-            print(f"[VOICE] {username} joined voice from {addr}")
+            print(f"[VOICE] {username} audio-registered from {addr}")
             continue
 
         if data.startswith(b"UNREGISTER:"):
