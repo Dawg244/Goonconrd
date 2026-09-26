@@ -22,9 +22,24 @@ try:
 except ImportError:
     SOUNDDEVICE_AVAILABLE = False
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_FILE = os.path.join(BASE_DIR, ".env")
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_DIR = BASE_DIR
+try:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    _test_settings_path = os.path.join(CONFIG_DIR, ".netra_write_test")
+    with open(_test_settings_path, "a", encoding="utf-8"):
+        pass
+    os.remove(_test_settings_path)
+except Exception:
+    CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NETRA")
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+ENV_FILE = os.path.join(CONFIG_DIR, ".env")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 load_dotenv(ENV_FILE, override=True)
 
 HOST = '108.221.36.120'
@@ -53,6 +68,30 @@ BTN_HOVER = "#1B3D1B"
 BTN_ACTIVE_BG = "#33FF33"
 BTN_ACTIVE_HOVER = "#29CC29"
 ERROR_RED = "#FF5555"
+
+
+def resample_pcm16_mono(data, src_rate, dst_rate):
+    """Linear-resample signed 16-bit mono PCM between device/network rates."""
+    if not data or src_rate == dst_rate:
+        return data
+    sample_count = len(data) // 2
+    if sample_count <= 1:
+        return data
+    src = struct.unpack("<%dh" % sample_count, data[:sample_count * 2])
+    out_count = max(1, int(round(sample_count * dst_rate / src_rate)))
+    out = bytearray(out_count * 2)
+    ratio = src_rate / dst_rate
+    for i in range(out_count):
+        pos = i * ratio
+        left = int(pos)
+        frac = pos - left
+        if left >= sample_count - 1:
+            value = src[-1]
+        else:
+            value = int(src[left] + (src[left + 1] - src[left]) * frac)
+        value = max(-32768, min(32767, value))
+        struct.pack_into("<h", out, i * 2, value)
+    return bytes(out)
 
 
 def generate_ping_wav(style="ping"):
@@ -145,10 +184,16 @@ def load_persistent_settings():
 
 
 def save_persistent_settings(data):
-    tmp = SETTINGS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    os.replace(tmp, SETTINGS_FILE)
+        f.flush()
+        os.fsync(f.fileno())
+    # Verify the file we just wrote can immediately be read back.
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+    if saved != data:
+        raise IOError("NETRA settings verification failed")
 
 
 class FullDiscordClone(ctk.CTk):
@@ -537,8 +582,8 @@ class FullDiscordClone(ctk.CTk):
         input_names, output_names = self.get_audio_device_names()
         input_values = ["Default"] + input_names
         output_values = ["Default"] + output_names
-        input_current = self.voice_device_input if self.voice_device_input in input_values else "Default"
-        output_current = self.voice_device_output if self.voice_device_output in output_values else "Default"
+        input_current = self.audio_index_to_selection(self.voice_device_input, input_values)
+        output_current = self.audio_index_to_selection(self.voice_device_output, output_values)
         input_var = ctk.StringVar(value=input_current)
         output_var = ctk.StringVar(value=output_current)
         ctk.CTkLabel(voice_frame, text="Microphone", font=(FONT_MONO, 9), text_color=FG_DIM).pack(anchor="w", padx=12)
@@ -555,7 +600,7 @@ class FullDiscordClone(ctk.CTk):
             out = self.audio_selection_to_index(output_var.get())
             path = self.dm_sound_path if mode == "custom" else self.dm_sound_path
             if self.save_settings_file(mode, path, inp, out):
-                status.configure(text="✓ SETTINGS SAVED", text_color=FG_BRIGHT)
+                status.configure(text=f"✓ SAVED: {SETTINGS_FILE}", text_color=FG_BRIGHT)
                 win.after(350, win.destroy)
 
         def reset_defaults():
@@ -906,17 +951,38 @@ class FullDiscordClone(ctk.CTk):
                 )
                 raise RuntimeError("old/ambiguous audio device setting")
 
-            if input_device is not None:
-                sd.check_input_settings(device=input_device, samplerate=VOICE_RATE, channels=VOICE_CHANNELS, dtype='int16')
-            if output_device is not None:
-                sd.check_output_settings(device=output_device, samplerate=VOICE_RATE, channels=VOICE_CHANNELS, dtype='int16')
+            # 16 kHz is NETRA's network format, but many Windows devices
+            # (especially webcam/USB microphones) do not accept 16 kHz directly.
+            # Use each device's advertised default/native rate and resample at the
+            # network boundary instead of asking PortAudio for an unsupported rate.
+            def device_default_rate(device_id, is_input):
+                try:
+                    info = sd.query_devices(device_id, "input" if is_input else "output")
+                    rate = int(round(float(info.get("default_samplerate", 48000))))
+                    if rate > 0:
+                        return rate
+                except Exception:
+                    pass
+                return 48000
+
+            self.voice_input_rate = device_default_rate(input_device, True)
+            self.voice_output_rate = device_default_rate(output_device, False)
+
+            try:
+                sd.check_input_settings(device=input_device, samplerate=self.voice_input_rate, channels=VOICE_CHANNELS, dtype='int16')
+            except Exception as e:
+                raise RuntimeError(f"Microphone does not accept {self.voice_input_rate} Hz: {e}")
+            try:
+                sd.check_output_settings(device=output_device, samplerate=self.voice_output_rate, channels=VOICE_CHANNELS, dtype='int16')
+            except Exception as e:
+                raise RuntimeError(f"Output device does not accept {self.voice_output_rate} Hz: {e}")
 
             self.voice_input_stream = sd.RawInputStream(
-                samplerate=VOICE_RATE, blocksize=VOICE_CHUNK, dtype='int16',
+                samplerate=self.voice_input_rate, blocksize=VOICE_CHUNK, dtype='int16',
                 channels=VOICE_CHANNELS, device=input_device, latency="low")
             self.voice_input_stream.start()
             self.voice_output_stream = sd.RawOutputStream(
-                samplerate=VOICE_RATE, blocksize=VOICE_CHUNK, dtype='int16',
+                samplerate=self.voice_output_rate, blocksize=VOICE_CHUNK, dtype='int16',
                 channels=VOICE_CHANNELS, device=output_device, latency="low")
             self.voice_output_stream.start()
 
@@ -942,7 +1008,9 @@ class FullDiscordClone(ctk.CTk):
                 data, overflowed = self.voice_input_stream.read(VOICE_CHUNK)
                 if self.voice_muted:
                     data = b"\x00" * len(data)
-                self.voice_socket.sendto(bytes(data), (HOST, VOICE_PORT))
+                # Convert device-native PCM to NETRA's fixed 16 kHz network format.
+                network_data = resample_pcm16_mono(bytes(data), self.voice_input_rate, VOICE_RATE)
+                self.voice_socket.sendto(network_data, (HOST, VOICE_PORT))
             except Exception:
                 break
 
@@ -955,7 +1023,10 @@ class FullDiscordClone(ctk.CTk):
             try:
                 data, _ = self.voice_socket.recvfrom(4096)
                 if self.voice_output_stream:
-                    self.voice_output_stream.write(data)
+                    # Convert NETRA's 16 kHz network audio to the selected output
+                    # device's native rate before handing it to PortAudio.
+                    playback_data = resample_pcm16_mono(data, VOICE_RATE, self.voice_output_rate)
+                    self.voice_output_stream.write(playback_data)
             except socket.timeout:
                 continue
             except Exception:
