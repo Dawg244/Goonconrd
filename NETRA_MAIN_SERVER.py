@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 
 HOST = "0.0.0.0"
 PORT = 12145
-VOICE_PORT = 12146
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ACCOUNTS_FILE = os.path.join(BASE_DIR, "netra_main_accounts.json")
 SERVERS_FILE = os.path.join(BASE_DIR, "netra_servers.json")
@@ -28,9 +27,6 @@ clients = {}              # username -> socket
 clients_lock = threading.RLock()
 voice_users = set()
 voice_lock = threading.RLock()
-# UDP voice relay: client UDP address -> username. Audio is never stored.
-voice_peers = {}
-voice_udp_lock = threading.RLock()
 chat_log = {"general-chat": [], "random": [], "dms": {}}
 chat_lock = threading.RLock()
 
@@ -184,71 +180,6 @@ def send_voice_list():
 
 
 
-def voice_udp_loop():
-    """Relay raw 16 kHz PCM packets between clients in the voice channel."""
-    global voice_peers
-    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp.bind((HOST, VOICE_PORT))
-    udp.settimeout(1.0)
-    print(f"NETRA VOICE UDP listening on {HOST}:{VOICE_PORT}")
-
-    while True:
-        try:
-            data, addr = udp.recvfrom(65535)
-        except socket.timeout:
-            continue
-        except Exception as e:
-            print(f"VOICE UDP receive error: {e}")
-            continue
-
-        if not data:
-            continue
-
-        # Control packets are tiny UTF-8 messages; all other packets are PCM.
-        if data.startswith(b"REGISTER:"):
-            try:
-                username = data.split(b":", 1)[1].decode("utf-8", "strict").strip()
-            except Exception:
-                continue
-            if username:
-                with voice_udp_lock:
-                    # Remove an old endpoint for the same username.
-                    for old_addr, old_user in list(voice_peers.items()):
-                        if old_user == username and old_addr != addr:
-                            voice_peers.pop(old_addr, None)
-                    voice_peers[addr] = username
-            continue
-
-        if data.startswith(b"UNREGISTER:"):
-            try:
-                username = data.split(b":", 1)[1].decode("utf-8", "strict").strip()
-            except Exception:
-                username = ""
-            with voice_udp_lock:
-                if username:
-                    for peer_addr, peer_user in list(voice_peers.items()):
-                        if peer_user == username:
-                            voice_peers.pop(peer_addr, None)
-                else:
-                    voice_peers.pop(addr, None)
-            continue
-
-        # Any normal packet proves the client's UDP mapping is still alive.
-        with voice_udp_lock:
-            sender = voice_peers.get(addr)
-            if sender is None:
-                continue
-            targets = [peer_addr for peer_addr, peer_user in voice_peers.items()
-                       if peer_user != sender]
-
-        for peer_addr in targets:
-            try:
-                udp.sendto(data, peer_addr)
-            except OSError:
-                pass
-
-
 
 def send_history(conn, username):
     with chat_lock:
@@ -323,6 +254,32 @@ def handle_line(conn, username, line):
         directory_response = process_directory_command(line)
         if directory_response is not None:
             send_line(conn, directory_response)
+        return username
+
+    if line.startswith("VOICE:"):
+        # Voice audio travels over the already-authenticated TCP connection.
+        # Format from client: VOICE:<base64 PCM>
+        # Server forwards it only to users currently in the same voice call.
+        encoded_audio = line.split(":", 1)[1] if ":" in line else ""
+        if not encoded_audio:
+            return username
+        if len(encoded_audio) > 20000:
+            print(f"[VOICE] Dropped oversized packet from {username}")
+            return username
+
+        with voice_lock:
+            voice_targets = set(voice_users)
+
+        with clients_lock:
+            targets = [(name, peer) for name, peer in clients.items()
+                       if name != username and name in voice_targets]
+
+        packet = f"VOICE:{username}:{encoded_audio}\n".encode("ascii", "ignore")
+        for target_name, peer in targets:
+            try:
+                peer.sendall(packet)
+            except OSError:
+                pass
         return username
 
     if line.startswith("PFP:"):
@@ -522,7 +479,7 @@ def directory_handle(conn, addr, first_line):
 load()
 print(f"NETRA MAIN SERVER listening on {HOST}:{PORT}")
 print("Central accounts + persistent chat + presence + PFP storage enabled.")
-threading.Thread(target=voice_udp_loop, daemon=True).start()
+print("NETRA VOICE: TCP audio relay enabled on the authenticated port 12145.")
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

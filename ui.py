@@ -381,6 +381,7 @@ class FullDiscordClone(ctk.CTk):
         self.voice_socket = None
         self.voice_input_stream = None
         self.voice_output_stream = None
+        self.voice_play_queue = queue.Queue(maxsize=80)
         self.voice_device_input = None
         self.voice_device_output = None
         self.voice_muted = False
@@ -419,8 +420,6 @@ class FullDiscordClone(ctk.CTk):
         self.channel_btn.pack(fill="x", padx=8, pady=(4, 2))
         self.random_channel_btn = ctk.CTkButton(self.sidebar_body, text="# random", font=(FONT_MONO, 12, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=lambda: self.select_channel("random"))
         self.random_channel_btn.pack(fill="x", padx=8, pady=2)
-        self.feature_btn = ctk.CTkButton(self.sidebar_body, text="✨ NETRA HUB", font=(FONT_MONO, 11, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=30, corner_radius=0, command=self.open_netra_hub)
-        self.feature_btn.pack(fill="x", padx=8, pady=(8,2))
         self.voice_btn = ctk.CTkButton(self.sidebar_body, text="🎤 Join Voice", font=(FONT_MONO, 12, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=32, corner_radius=0, command=self.toggle_voice_chat)
         self.voice_mute_btn = ctk.CTkButton(self.sidebar_body, text="🔇 Mute Mic", font=(FONT_MONO, 11, "bold"), fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, height=28, corner_radius=0, command=self.toggle_voice_mute)
         self.dm_list_frame = ctk.CTkFrame(self.sidebar_body, fg_color="transparent", corner_radius=0)
@@ -1015,7 +1014,7 @@ class FullDiscordClone(ctk.CTk):
     def open_settings(self):
         win = ctk.CTkToplevel(self)
         win.title("NETRA // Settings")
-        win.geometry("560x570")
+        win.geometry("700x760")
         win.resizable(False, False)
         win.configure(fg_color=BG_ROOT)
         win.transient(self)
@@ -1070,7 +1069,67 @@ class FullDiscordClone(ctk.CTk):
         ctk.CTkLabel(voice_frame, text="Microphone", font=(FONT_MONO, 9), text_color=FG_DIM).pack(anchor="w", padx=12)
         ctk.CTkOptionMenu(voice_frame, variable=input_var, values=input_values, width=480, fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9)).pack(padx=12, pady=(2, 7))
         ctk.CTkLabel(voice_frame, text="Output / speakers", font=(FONT_MONO, 9), text_color=FG_DIM).pack(anchor="w", padx=12)
-        ctk.CTkOptionMenu(voice_frame, variable=output_var, values=output_values, width=480, fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9)).pack(padx=12, pady=(2, 10))
+        ctk.CTkOptionMenu(voice_frame, variable=output_var, values=output_values, width=480, fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9)).pack(padx=12, pady=(2, 6))
+
+        voice_test_status = ctk.CTkLabel(voice_frame, text="Select a microphone, then TEST MICROPHONE before joining a call.", font=(FONT_MONO, 9), text_color=FG_FAINT)
+        voice_test_status.pack(anchor="w", padx=12, pady=(0, 5))
+
+        def test_microphone():
+            if not SOUNDDEVICE_AVAILABLE:
+                voice_test_status.configure(text="sounddevice is not installed.", text_color=ERROR_RED)
+                return
+            device = self.audio_selection_to_index(input_var.get())
+            try:
+                info = sd.query_devices(device, "input")
+                rate = int(round(float(info.get("default_samplerate", 48000))))
+                channels = max(1, min(VOICE_CHANNELS, int(info.get("max_input_channels", 1))))
+                samples_seen = 0
+                peak = 0
+                voice_test_status.configure(text=f"Testing [{device if device is not None else 'Default'}] {info.get('name','')}...", text_color=FG_DIM)
+
+                def worker():
+                    nonlocal samples_seen, peak
+                    try:
+                        with sd.RawInputStream(samplerate=rate, blocksize=1024, dtype="int16", channels=channels, device=device, latency="low") as stream:
+                            deadline = time.monotonic() + 3.0
+                            while time.monotonic() < deadline:
+                                data, _ = stream.read(1024)
+                                raw = bytes(data)
+                                if raw:
+                                    vals = struct.unpack("<%dh" % (len(raw)//2), raw[:(len(raw)//2)*2])
+                                    if vals:
+                                        chunk_peak = max(abs(v) for v in vals)
+                                        peak = max(peak, chunk_peak)
+                                        samples_seen += len(vals)
+                        db = -60.0 if peak <= 0 else 20.0 * math.log10(peak / 32768.0)
+                        result = f"✓ Mic test complete // peak {peak} ({db:.1f} dBFS) // samples {samples_seen}"
+                        color = FG_BRIGHT if peak > 300 else ERROR_RED
+                    except Exception as exc:
+                        result = f"✗ Microphone test failed: {exc}"
+                        color = ERROR_RED
+                    self.after(0, lambda: voice_test_status.configure(text=result, text_color=color))
+                threading.Thread(target=worker, daemon=True).start()
+            except Exception as exc:
+                voice_test_status.configure(text=f"✗ Microphone unavailable: {exc}", text_color=ERROR_RED)
+
+        ctk.CTkButton(voice_frame, text="🎙 TEST MICROPHONE (3 SEC)", command=test_microphone, width=230, height=28, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9, "bold")).pack(anchor="w", padx=12, pady=(0, 10))
+
+        hub_frame = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=0)
+        hub_frame.pack(fill="x", padx=20, pady=8)
+        ctk.CTkLabel(hub_frame, text="NETRA HUB", font=(FONT_MONO, 11, "bold"), text_color=FG_BRIGHT).pack(anchor="w", padx=12, pady=(10, 7))
+        hub_grid = ctk.CTkFrame(hub_frame, fg_color="transparent")
+        hub_grid.pack(fill="x", padx=8, pady=(0, 10))
+        hub_items = [
+            ("👤 PROFILE", self.open_profile), ("🟢 STATUS", self.open_status),
+            ("⭐ FAVORITES", self.open_favorites), ("🔔 NOTIFICATIONS", self.open_notifications),
+            ("📌 PINNED", self.open_pins), ("🔎 SEARCH", self.open_search),
+            ("🌐 SERVER BROWSER", self.open_server_browser), ("🎨 THEMES", self.open_themes),
+            ("🛡 SERVER / CHANNEL TOOLS", self.open_channel_tools),
+        ]
+        for n, (label, cmd) in enumerate(hub_items):
+            ctk.CTkButton(hub_grid, text=label, command=cmd, height=32, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9, "bold")).grid(row=n//2, column=n%2, sticky="ew", padx=4, pady=3)
+        hub_grid.grid_columnconfigure(0, weight=1)
+        hub_grid.grid_columnconfigure(1, weight=1)
 
         status = ctk.CTkLabel(win, text="Changes are not permanent until SAVE SETTINGS is pressed.", font=(FONT_MONO, 9), text_color=FG_DIM)
         status.pack(pady=(3, 5))
@@ -1434,6 +1493,17 @@ class FullDiscordClone(ctk.CTk):
             names_raw = raw_message.split(":", 1)[1]
             voice_user_list = [u for u in names_raw.split(",") if u]
             self.after(0, self.update_voice_users_ui, voice_user_list)
+        elif raw_message.startswith("VOICE:"):
+            # Voice is transported over the already-authenticated TCP connection.
+            # This avoids requiring a second UDP port through NAT/firewalls.
+            parts = raw_message.split(":", 2)
+            if len(parts) == 3 and parts[1] != my_name and self.in_voice_chat:
+                try:
+                    pcm = base64.b64decode(parts[2], validate=True)
+                    if pcm:
+                        self.voice_play_queue.put(pcm)
+                except Exception:
+                    pass
         elif raw_message.startswith("USERS:"):
             users_raw = raw_message.split(":", 1)[1]
             user_list = [u for u in users_raw.split(",") if u]
@@ -1835,11 +1905,8 @@ class FullDiscordClone(ctk.CTk):
         self._refresh_unread_badges()
 
     def open_netra_hub(self):
-        win=ctk.CTkToplevel(self); win.title('NETRA // HUB'); win.geometry('520x620'); win.configure(fg_color=BG_ROOT); win.transient(self)
-        ctk.CTkLabel(win,text='NETRA // FEATURES',font=(FONT_MONO,20,'bold'),text_color=FG_BRIGHT).pack(pady=(20,10))
-        items=[('👤 PROFILE',self.open_profile),('🟢 PRESENCE / STATUS',self.open_status),('⭐ FAVORITES',self.open_favorites),('🔔 NOTIFICATIONS',self.open_notifications),('📌 PINNED MESSAGES',self.open_pins),('🔎 SEARCH MESSAGES',self.open_search),('🌐 SERVER BROWSER',self.open_server_browser),('🎨 THEMES',self.open_themes),('🛡️ SERVER / CHANNEL TOOLS',self.open_channel_tools)]
-        for text,cmd in items: ctk.CTkButton(win,text=text,command=cmd,height=38,corner_radius=0,fg_color=BTN_BG,hover_color=BTN_HOVER,text_color=FG_BRIGHT,font=(FONT_MONO,11,'bold')).pack(fill='x',padx=35,pady=5)
-        ctk.CTkLabel(win,text='Right-click messages for reply / edit / delete / react / pin.',font=(FONT_MONO,9),text_color=FG_FAINT).pack(pady=18)
+        # NETRA HUB was merged into Settings. Keep this method for old callbacks.
+        self.open_settings()
 
     def simple_window(self,title,lines,buttons=None,size='460x420'):
         win=ctk.CTkToplevel(self); win.title(title); win.geometry(size); win.configure(fg_color=BG_ROOT); win.transient(self)
@@ -1963,103 +2030,118 @@ class FullDiscordClone(ctk.CTk):
         if not username:
             return
         try:
-            self.voice_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.voice_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-            self.voice_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
-            self.voice_socket.sendto(f"REGISTER:{username}".encode('utf-8'), (self.server_host, self.voice_port if hasattr(self,"voice_port") else VOICE_PORT))
-
             input_device = self.voice_device_input
             output_device = self.voice_device_output
 
-            # Never pass a duplicate device NAME to sounddevice.  NETRA
-            # always uses a concrete numeric device ID here.
+            # None means the Windows default device. Saved numeric IDs are used
+            # when the user explicitly selected a device in Settings.
             if isinstance(input_device, str) or isinstance(output_device, str):
                 self.append_system_error(
-                    "NETRA voice settings contained an old device name. "
-                    "Open Settings, select the exact [ID] device, then SAVE SETTINGS."
+                    "NETRA voice settings contained an old device name. Open Settings, "
+                    "select the exact [ID] microphone/speaker, then SAVE SETTINGS."
                 )
                 raise RuntimeError("old/ambiguous audio device setting")
 
-            # 16 kHz is NETRA's network format, but many Windows devices
-            # (especially webcam/USB microphones) do not accept 16 kHz directly.
-            # Use each device's advertised default/native rate and resample at the
-            # network boundary instead of asking PortAudio for an unsupported rate.
             def device_default_rate(device_id, is_input):
                 try:
                     info = sd.query_devices(device_id, "input" if is_input else "output")
                     rate = int(round(float(info.get("default_samplerate", 48000))))
-                    if rate > 0:
-                        return rate
+                    return rate if rate > 0 else 48000
                 except Exception:
-                    pass
-                return 48000
+                    return 48000
 
             self.voice_input_rate = device_default_rate(input_device, True)
             self.voice_output_rate = device_default_rate(output_device, False)
 
-            try:
-                sd.check_input_settings(device=input_device, samplerate=self.voice_input_rate, channels=VOICE_CHANNELS, dtype='int16')
-            except Exception as e:
-                raise RuntimeError(f"Microphone does not accept {self.voice_input_rate} Hz: {e}")
-            try:
-                sd.check_output_settings(device=output_device, samplerate=self.voice_output_rate, channels=VOICE_CHANNELS, dtype='int16')
-            except Exception as e:
-                raise RuntimeError(f"Output device does not accept {self.voice_output_rate} Hz: {e}")
+            sd.check_input_settings(
+                device=input_device, samplerate=self.voice_input_rate,
+                channels=VOICE_CHANNELS, dtype="int16"
+            )
+            sd.check_output_settings(
+                device=output_device, samplerate=self.voice_output_rate,
+                channels=VOICE_CHANNELS, dtype="int16"
+            )
 
             self.voice_input_stream = sd.RawInputStream(
-                samplerate=self.voice_input_rate, blocksize=VOICE_CHUNK, dtype='int16',
-                channels=VOICE_CHANNELS, device=input_device, latency="low")
-            self.voice_input_stream.start()
+                samplerate=self.voice_input_rate, blocksize=VOICE_CHUNK,
+                dtype="int16", channels=VOICE_CHANNELS, device=input_device, latency="low"
+            )
             self.voice_output_stream = sd.RawOutputStream(
-                samplerate=self.voice_output_rate, blocksize=VOICE_CHUNK, dtype='int16',
-                channels=VOICE_CHANNELS, device=output_device, latency="low")
+                samplerate=self.voice_output_rate, blocksize=VOICE_CHUNK,
+                dtype="int16", channels=VOICE_CHANNELS, device=output_device, latency="low"
+            )
+            self.voice_input_stream.start()
             self.voice_output_stream.start()
 
-            self.in_voice_chat = True
-            self.voice_btn.configure(text="🎤 Leave Voice", fg_color=BTN_ACTIVE_BG, hover_color=BTN_ACTIVE_HOVER, text_color="black")
-            self.after(0, self.update_voice_users_ui, self.last_voice_user_list)
+            # Drain anything left over from a previous call.
+            try:
+                while True:
+                    self.voice_play_queue.get_nowait()
+            except queue.Empty:
+                pass
 
-            # Tell the server over TCP too, so "who's in voice" works even if
-            # the UDP voice port isn't forwarded on your router.
+            self.in_voice_chat = True
+            self.voice_btn.configure(
+                text="🎤 Leave Voice", fg_color=BTN_ACTIVE_BG,
+                hover_color=BTN_ACTIVE_HOVER, text_color="black"
+            )
             try:
                 self.client_socket.sendall(b"VOICEJOIN:1\n")
             except Exception:
                 pass
 
             threading.Thread(target=self.voice_send_loop, daemon=True).start()
-            threading.Thread(target=self.voice_recv_loop, daemon=True).start()
+            threading.Thread(target=self.voice_playback_loop, daemon=True).start()
+            self.append_system_error(
+                f"Voice connected // mic={self.voice_input_rate}Hz // output={self.voice_output_rate}Hz"
+            )
         except Exception as e:
             self.append_system_error(f"Could not start voice chat: {e}")
             self.stop_voice_chat()
 
     def voice_send_loop(self):
+        # Voice packets travel over the authenticated NETRA TCP connection.
+        # This makes calls work without UDP port-forwarding.
         while self.in_voice_chat:
             try:
                 data, overflowed = self.voice_input_stream.read(VOICE_CHUNK)
+                pcm = bytes(data)
                 if self.voice_muted:
-                    data = b"\x00" * len(data)
-                # Convert device-native PCM to NETRA's fixed 16 kHz network format.
-                network_data = resample_pcm16_mono(bytes(data), self.voice_input_rate, VOICE_RATE)
-                self.voice_socket.sendto(network_data, (self.server_host, self.voice_port if hasattr(self,"voice_port") else VOICE_PORT))
-            except Exception:
+                    pcm = b"\x00" * len(pcm)
+                network_data = resample_pcm16_mono(
+                    pcm, self.voice_input_rate, VOICE_RATE
+                )
+                if network_data and self.client_socket:
+                    encoded = base64.b64encode(network_data).decode("ascii")
+                    self.client_socket.sendall(
+                        f"VOICE:{encoded}\n".encode("ascii")
+                    )
+            except Exception as e:
+                if self.in_voice_chat:
+                    try:
+                        self.after(0, self.append_system_error, f"Voice microphone/send error: {e}")
+                    except Exception:
+                        pass
                 break
 
-    def voice_recv_loop(self):
-        try:
-            self.voice_socket.settimeout(1.0)
-        except Exception:
-            pass
+    def voice_playback_loop(self):
         while self.in_voice_chat:
             try:
-                data, _ = self.voice_socket.recvfrom(4096)
-                if self.voice_output_stream:
-                    # Convert NETRA's 16 kHz network audio to the selected output
-                    # device's native rate before handing it to PortAudio.
-                    playback_data = resample_pcm16_mono(data, VOICE_RATE, self.voice_output_rate)
-                    self.voice_output_stream.write(playback_data)
-            except socket.timeout:
+                data = self.voice_play_queue.get(timeout=0.5)
+            except queue.Empty:
                 continue
-            except Exception:
+            try:
+                if self.voice_output_stream:
+                    playback_data = resample_pcm16_mono(
+                        data, VOICE_RATE, self.voice_output_rate
+                    )
+                    self.voice_output_stream.write(playback_data)
+            except Exception as e:
+                if self.in_voice_chat:
+                    try:
+                        self.after(0, self.append_system_error, f"Voice playback error: {e}")
+                    except Exception:
+                        pass
                 break
 
     def toggle_voice_mute(self):
@@ -2078,12 +2160,6 @@ class FullDiscordClone(ctk.CTk):
         try:
             if self.client_socket:
                 self.client_socket.sendall(b"VOICELEAVE:1\n")
-        except Exception:
-            pass
-        username = self.username_entry.get().strip()
-        try:
-            if self.voice_socket and username:
-                self.voice_socket.sendto(f"UNREGISTER:{username}".encode('utf-8'), (self.server_host, self.voice_port if hasattr(self,"voice_port") else VOICE_PORT))
         except Exception:
             pass
         for stream in (self.voice_input_stream, self.voice_output_stream):
