@@ -9,6 +9,7 @@ import struct
 import wave
 import tempfile
 import subprocess
+import shutil
 import base64
 import json
 import re
@@ -43,11 +44,17 @@ except Exception:
 
 ENV_FILE = os.path.join(CONFIG_DIR, ".env")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+CHAT_CACHE_FILE = os.path.join(CONFIG_DIR, "chat_cache.json")
+PROFILE_IMAGE_FILE = os.path.join(CONFIG_DIR, "profile.png")
+# Theme-specific Windows application icons.  Put the .ico files in this folder.
+ICON_DIR = os.path.join(BASE_DIR, "assets", "icons")
+os.makedirs(ICON_DIR, exist_ok=True)
 load_dotenv(ENV_FILE, override=True)
 
+# NETRA always connects to the main server.
 DEFAULT_HOST = '108.221.36.120'
-PORT = 12155
-VOICE_PORT = 12156
+PORT = 12145
+VOICE_PORT = 12146
 MAIN_PORT = 12145
 
 VOICE_CHUNK = 1024
@@ -162,35 +169,77 @@ THEMES = {
         "panel_alt": "#0E1C0E", "input": "#0C1A0C", "bright": "#33FF33",
         "dim": "#1E8C1E", "faint": "#145214", "border": "#123312",
         "button": "#0F1F0F", "hover": "#1B3D1B", "active": "#33FF33",
-        "active_hover": "#29CC29", "error": "#FF5555", "appearance": "Dark"
+        "active_hover": "#29CC29", "error": "#FF5555", "appearance": "Dark", "icon": "netra_terminal.ico"
     },
     "Midnight": {
         "root": "#080B14", "rail": "#050711", "panel": "#0D1220",
         "panel_alt": "#12192A", "input": "#101729", "bright": "#62B0FF",
         "dim": "#3B78B5", "faint": "#29435F", "border": "#1E3550",
         "button": "#121D30", "hover": "#1B3150", "active": "#62B0FF",
-        "active_hover": "#3D8FE0", "error": "#FF667A", "appearance": "Dark"
+        "active_hover": "#3D8FE0", "error": "#FF667A", "appearance": "Dark", "icon": "midnight.ico"
     },
     "Light": {
         "root": "#E9EDF2", "rail": "#D7DDE5", "panel": "#F6F8FA",
         "panel_alt": "#E1E6ED", "input": "#FFFFFF", "bright": "#146CDA",
         "dim": "#3D6F9F", "faint": "#718096", "border": "#B8C2CF",
         "button": "#DCE4ED", "hover": "#C9D8E8", "active": "#146CDA",
-        "active_hover": "#0F5BB9", "error": "#C62828", "appearance": "Light"
+        "active_hover": "#0F5BB9", "error": "#C62828", "appearance": "Light", "icon": "light.ico"
     },
     "CRT Amber": {
         "root": "#090704", "rail": "#050402", "panel": "#151008",
         "panel_alt": "#1C150B", "input": "#120D06", "bright": "#FFB000",
         "dim": "#A87300", "faint": "#664900", "border": "#4A3400",
         "button": "#1B1408", "hover": "#332308", "active": "#FFB000",
-        "active_hover": "#D99300", "error": "#FF5F56", "appearance": "Dark"
+        "active_hover": "#D99300", "error": "#FF5F56", "appearance": "Dark", "icon": "crt_amber.ico"
     },
     "Violet": {
         "root": "#0B0710", "rail": "#06040A", "panel": "#140D1C",
         "panel_alt": "#1D1328", "input": "#160E20", "bright": "#D18BFF",
         "dim": "#8D5BB0", "faint": "#593A70", "border": "#412852",
         "button": "#1B1025", "hover": "#302044", "active": "#D18BFF",
-        "active_hover": "#A962D5", "error": "#FF668F", "appearance": "Dark"
+        "active_hover": "#A962D5", "error": "#FF668F", "appearance": "Dark", "icon": "violet.ico"
+    },
+    "Ocean": {
+        "root": "#061018", "rail": "#030A10", "panel": "#0A1822",
+        "panel_alt": "#0E202C", "input": "#0B1B27", "bright": "#42D9FF",
+        "dim": "#2D91AD", "faint": "#20566A", "border": "#164454",
+        "button": "#0E2530", "hover": "#174353", "active": "#42D9FF",
+        "active_hover": "#27B6D8", "error": "#FF6B7A", "appearance": "Dark", "icon": "ocean.ico"
+    },
+    "Dracula": {
+        "root": "#17151F", "rail": "#100F16", "panel": "#211F2B",
+        "panel_alt": "#2A2737", "input": "#242130", "bright": "#BD93F9",
+        "dim": "#8F7AB8", "faint": "#5E5578", "border": "#4B435F",
+        "button": "#29253A", "hover": "#3B3452", "active": "#FF79C6",
+        "active_hover": "#D95FA8", "error": "#FF5555", "appearance": "Dark", "icon": "dracula.ico"
+    },
+    "Nord": {
+        "root": "#202733", "rail": "#171D26", "panel": "#2B3442",
+        "panel_alt": "#344050", "input": "#303B4B", "bright": "#88C0D0",
+        "dim": "#6D91A0", "faint": "#526A76", "border": "#465565",
+        "button": "#344252", "hover": "#405365", "active": "#8FBCBB",
+        "active_hover": "#6FA5A4", "error": "#BF616A", "appearance": "Dark", "icon": "nord.ico"
+    },
+    "Solarized": {
+        "root": "#002B36", "rail": "#001F27", "panel": "#073642",
+        "panel_alt": "#0B4350", "input": "#083C47", "bright": "#B8D4C8",
+        "dim": "#839496", "faint": "#586E75", "border": "#31535B",
+        "button": "#0A404B", "hover": "#155764", "active": "#2AA198",
+        "active_hover": "#238A82", "error": "#DC322F", "appearance": "Dark", "icon": "solarized.ico"
+    },
+    "Sakura": {
+        "root": "#190E15", "rail": "#10080E", "panel": "#26131F",
+        "panel_alt": "#321A29", "input": "#2B1624", "bright": "#FF9BCB",
+        "dim": "#B86E93", "faint": "#75465F", "border": "#5A3048",
+        "button": "#351B2C", "hover": "#4A263D", "active": "#FF9BCB",
+        "active_hover": "#DE77AA", "error": "#FF6677", "appearance": "Dark", "icon": "sakura.ico"
+    },
+    "Mono": {
+        "root": "#111111", "rail": "#080808", "panel": "#1B1B1B",
+        "panel_alt": "#242424", "input": "#202020", "bright": "#F2F2F2",
+        "dim": "#B5B5B5", "faint": "#6E6E6E", "border": "#454545",
+        "button": "#252525", "hover": "#383838", "active": "#F2F2F2",
+        "active_hover": "#D0D0D0", "error": "#FF6B6B", "appearance": "Dark", "icon": "mono.ico"
     },
 }
 
@@ -282,18 +331,16 @@ class FullDiscordClone(ctk.CTk):
         self.configure(fg_color=BG_ROOT)
 
         self.client_socket = None
-        self.server_host = os.getenv("NETRA_SERVER_IP", DEFAULT_HOST)
+        self.server_host = DEFAULT_HOST
         self.server_port = PORT
         self.voice_port = VOICE_PORT
-        if ":" in self.server_host and self.server_host.count(":") == 1:
-            _h,_p=self.server_host.rsplit(":",1)
-            if _p.isdigit(): self.server_host,self.server_port=_h,int(_p)
         self.account_id = os.getenv("NETRA_ACCOUNT_ID", "")
         self.authenticated = False
         self.auth_window = None
         self.auth_waiting = True
         self.current_target = "general-chat"
         self.chat_history = {"general-chat": [], "random": []}
+        self._load_local_chat_cache()
         self.all_rendered_widgets = []
         self.chat_room_frames = {}
         self.chat_room_built = set()
@@ -317,6 +364,9 @@ class FullDiscordClone(ctk.CTk):
         self.draft_messages = {}
         self.favorites = set()
         self.blocked_users = set()
+        # Messages rendered locally before the server echoes them back.
+        # The server echo is matched and ignored so messages do not appear twice.
+        self._pending_local_messages = set()
 
         # username -> PIL.Image, so we can regenerate CTkImages at any size
         self.default_pil_pfp = Image.new('RGB', (40, 40), color='#0F3D0F')
@@ -543,19 +593,17 @@ class FullDiscordClone(ctk.CTk):
             pass
 
     def connect_to_server_from_bar(self):
-        host = self.server_ip_entry.get().strip()
-        if not host:
-            return
-        server_port = PORT
-        if ":" in host and host.count(":") == 1:
-            raw_host, raw_port = host.rsplit(":", 1)
-            if raw_port.isdigit():
-                host, server_port = raw_host.strip(), int(raw_port)
-        self.server_host = host
-        self.server_port = server_port
-        self.voice_port = server_port + 1
-        set_key(ENV_FILE, "NETRA_SERVER_IP", f"{host}:{server_port}")
-        self.server_ip_small.configure(text=f"{host}:{server_port}")
+        # Server selection is intentionally disabled: NETRA always uses the
+        # main server at 108.221.36.120:12145.
+        self.server_host = DEFAULT_HOST
+        self.server_port = PORT
+        self.voice_port = VOICE_PORT
+        try:
+            self.server_ip_entry.delete(0, "end")
+            self.server_ip_entry.insert(0, f"{DEFAULT_HOST}:{PORT}")
+            self.server_ip_small.configure(text=f"{DEFAULT_HOST}:{PORT}")
+        except Exception:
+            pass
         self.server_status_label.configure(text="connecting...", text_color=FG_DIM)
         self.authenticated = False
         self.open_auth_window()
@@ -635,14 +683,23 @@ class FullDiscordClone(ctk.CTk):
 
 
     def load_saved_profile(self):
+        """Load the user's PFP from NETRA's own config folder.
+
+        The image is copied into CONFIG_DIR so changing the original file,
+        moving it, or launching NETRA from another folder does not reset it.
+        """
         saved_pfp_path = os.getenv("CHAT_PFP_PATH", "")
-        if saved_pfp_path and os.path.exists(saved_pfp_path):
-            try:
-                self.pil_pfp = Image.open(saved_pfp_path).convert('RGB').resize((40, 40), Image.Resampling.LANCZOS)
-            except:
-                self.pil_pfp = Image.new('RGB', (40, 40), color='#0F3D0F')
-        else:
-            self.pil_pfp = Image.new('RGB', (40, 40), color='#0F3D0F')
+        candidates = [PROFILE_IMAGE_FILE, saved_pfp_path]
+        self.pil_pfp = None
+        for path in candidates:
+            if path and os.path.exists(path):
+                try:
+                    self.pil_pfp = Image.open(path).convert("RGB").resize((40, 40), Image.Resampling.LANCZOS)
+                    break
+                except Exception:
+                    pass
+        if self.pil_pfp is None:
+            self.pil_pfp = Image.new("RGB", (40, 40), color="#0F3D0F")
         self.ctk_pfp = ctk.CTkImage(light_image=self.pil_pfp, dark_image=self.pil_pfp, size=(40, 40))
         self.pfp_label.configure(image=self.ctk_pfp)
 
@@ -673,9 +730,13 @@ class FullDiscordClone(ctk.CTk):
                 if my_name:
                     self.user_pil_pfps[my_name] = self.pil_pfp
 
+                # Keep a private NETRA copy instead of depending on the original
+                # image path. This makes the PFP survive restarts and moved files.
+                os.makedirs(CONFIG_DIR, exist_ok=True)
+                shutil.copy2(file_path, PROFILE_IMAGE_FILE)
                 if not os.path.exists(ENV_FILE):
                     open(ENV_FILE, 'w').close()
-                set_key(ENV_FILE, "CHAT_PFP_PATH", file_path)
+                set_key(ENV_FILE, "CHAT_PFP_PATH", PROFILE_IMAGE_FILE)
 
                 self.send_own_pfp()
                 self.reload_current_chat_view()
@@ -760,6 +821,7 @@ class FullDiscordClone(ctk.CTk):
         BTN_ACTIVE_BG = palette["active"]; BTN_ACTIVE_HOVER = palette["active_hover"]; ERROR_RED = palette["error"]
         ctk.set_appearance_mode(palette.get("appearance", "Dark"))
         self.theme_name = theme_name
+        self._apply_app_icon(theme_name)
 
         if not update_widgets:
             return
@@ -811,6 +873,34 @@ class FullDiscordClone(ctk.CTk):
             for top in self.winfo_toplevel().winfo_children():
                 try: top.configure(fg_color=BG_ROOT)
                 except Exception: pass
+        except Exception:
+            pass
+
+    def _apply_app_icon(self, theme_name=None):
+        """Apply the .ico associated with the active theme on Windows.
+
+        Missing icons are intentionally ignored so themes still work before
+        the icon pack is supplied by the NETRA designer.
+        """
+        try:
+            theme_name = theme_name or getattr(self, "theme_name", "NETRA Terminal")
+            filename = THEMES.get(theme_name, {}).get("icon", "netra_terminal.ico")
+            path = os.path.join(ICON_DIR, filename)
+            if os.name == "nt" and os.path.isfile(path):
+                self.iconbitmap(path)
+                self._netra_icon_path = path
+        except Exception:
+            pass
+
+    def update_input_placeholder(self):
+        """Keep the composer placeholder in sync with the active room."""
+        try:
+            target = self.current_target
+            if target in self.server_channels:
+                value = f"Message #{target}"
+            else:
+                value = f"Message @{target}"
+            self.message_entry.configure(placeholder_text=value)
         except Exception:
             pass
 
@@ -1059,105 +1149,123 @@ class FullDiscordClone(ctk.CTk):
     # ---------- Networking ----------
 
     def open_auth_window(self):
-        if self.auth_window is not None and self.auth_window.winfo_exists():
-            self.auth_window.focus_force()
-            return
+        """Show the account login/register dialog.
+
+        The server address is intentionally NOT part of authentication UI.
+        NETRA always connects internally to DEFAULT_HOST:PORT.
+        """
+        if self.auth_window is not None:
+            try:
+                if self.auth_window.winfo_exists():
+                    self.auth_window.focus_force()
+                    return
+            except Exception:
+                self.auth_window = None
+
         win = ctk.CTkToplevel(self)
         self.auth_window = win
         win.title("NETRA // Account")
-        win.geometry("430x520")
+        win.geometry("430x440")
         win.resizable(False, False)
         win.configure(fg_color=BG_PANEL)
         win.transient(self)
         win.grab_set()
         win.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        ctk.CTkLabel(win, text="NETRA // ACCOUNT", font=(FONT_MONO, 22, "bold"), text_color=FG_BRIGHT).pack(pady=(28, 4))
-        ctk.CTkLabel(win, text="Sign in to your permanent NETRA identity", font=(FONT_MONO, 11), text_color=FG_DIM).pack(pady=(0, 12))
+        ctk.CTkLabel(
+            win, text="NETRA // ACCOUNT",
+            font=(FONT_MONO, 22, "bold"), text_color=FG_BRIGHT
+        ).pack(pady=(30, 4))
+        ctk.CTkLabel(
+            win, text="LOGIN OR CREATE YOUR NETRA ACCOUNT",
+            font=(FONT_MONO, 10), text_color=FG_DIM
+        ).pack(pady=(0, 22))
 
-        # Server selection is intentionally available BEFORE authentication so a
-        # user is never trapped on a stale/saved server address.
-        ctk.CTkLabel(win, text="SERVER ADDRESS", font=(FONT_MONO, 9, "bold"), text_color=FG_DIM).pack(pady=(2, 4))
-        server_entry = ctk.CTkEntry(
+        ctk.CTkLabel(
+            win, text="USERNAME", font=(FONT_MONO, 9, "bold"),
+            text_color=FG_DIM
+        ).pack(pady=(0, 4))
+        username = ctk.CTkEntry(
             win, width=320, height=38, corner_radius=0,
             fg_color=BG_INPUT, border_color=BORDER_GREEN,
             text_color=FG_BRIGHT, font=(FONT_MONO, 12)
         )
-        server_entry.insert(0, f"{self.server_host}:{self.server_port}")
-        server_entry.pack(pady=(0, 5))
+        saved_username = os.getenv("CHAT_USERNAME", "")
+        if saved_username and saved_username != "User":
+            username.insert(0, saved_username)
+        username.pack(pady=(0, 12))
 
-        server_status = ctk.CTkLabel(win, text="", font=(FONT_MONO, 8), text_color=FG_DIM)
-        server_status.pack(pady=(0, 8))
+        ctk.CTkLabel(
+            win, text="PASSWORD", font=(FONT_MONO, 9, "bold"),
+            text_color=FG_DIM
+        ).pack(pady=(0, 4))
+        password = ctk.CTkEntry(
+            win, width=320, height=38, corner_radius=0,
+            fg_color=BG_INPUT, border_color=BORDER_GREEN,
+            text_color=FG_BRIGHT, font=(FONT_MONO, 12), show="*"
+        )
+        password.pack(pady=(0, 12))
 
-        def apply_server():
-            raw = server_entry.get().strip()
-            if not raw:
-                server_status.configure(text="Enter a server address.", text_color=ERROR_RED)
-                return
-            new_host = raw
-            new_port = PORT
-            if ":" in raw and raw.count(":") == 1:
-                candidate_host, candidate_port = raw.rsplit(":", 1)
-                if candidate_port.isdigit():
-                    new_host = candidate_host.strip()
-                    new_port = int(candidate_port)
-            new_host = new_host.strip()
-            if not new_host:
-                server_status.configure(text="Invalid server address.", text_color=ERROR_RED)
-                return
-            self.server_host = new_host
-            self.server_port = new_port
-            self.voice_port = new_port + 1
-            try:
-                set_key(ENV_FILE, "NETRA_SERVER_IP", f"{new_host}:{new_port}")
-            except Exception:
-                pass
-            self.server_ip_entry.delete(0, "end")
-            self.server_ip_entry.insert(0, f"{new_host}:{new_port}")
-            self.server_ip_small.configure(text=f"{new_host}:{new_port}")
-            try:
-                if win.winfo_exists():
-                    server_status.configure(text=f"Using {new_host}:{new_port}", text_color=FG_DIM)
-            except (tkinter.TclError, Exception):
-                pass
-            try:
-                auth_status = getattr(self, "_auth_status_label", None)
-                if auth_status is not None and auth_status.winfo_exists():
-                    auth_status.configure(text="")
-            except (tkinter.TclError, Exception):
-                pass
-
-        ctk.CTkButton(
-            win, text="USE SERVER", width=145, height=32, corner_radius=0,
-            fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT,
-            font=(FONT_MONO, 10, "bold"), command=apply_server
-        ).pack(pady=(0, 8))
+        status = ctk.CTkLabel(
+            win, text="", font=(FONT_MONO, 9),
+            text_color=ERROR_RED, wraplength=360
+        )
+        status.pack(pady=(0, 8))
+        self._auth_status_label = status
 
         mode = ctk.StringVar(value="LOGIN")
-        username = ctk.CTkEntry(win, placeholder_text="Username", width=320, height=42, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 13))
-        username.pack(pady=8)
-        password = ctk.CTkEntry(win, placeholder_text="Password", show="•", width=320, height=42, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 13))
-        password.pack(pady=8)
-
-        status = ctk.CTkLabel(win, text="", font=(FONT_MONO, 10), text_color=ERROR_RED, wraplength=340)
-        status.pack(pady=(8, 10))
 
         def submit():
-            u = username.get().strip()
+            name = username.get().strip()
             pw = password.get()
-            if not u or not pw:
-                status.configure(text="Enter a username and password.")
-                return
-            self._auth_username = u
-            self._auth_password = pw
-            self._auth_mode = mode.get()
-            self._auth_status_label = status
-            self.connect_and_auth(u, pw, self._auth_mode)
+            selected_mode = mode.get()
 
-        ctk.CTkButton(win, text="LOGIN", width=145, height=40, corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black", font=(FONT_MONO, 12, "bold"), command=lambda: (mode.set("LOGIN"), submit())).pack(pady=(4, 6))
-        ctk.CTkButton(win, text="CREATE ACCOUNT", width=145, height=40, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 11, "bold"), command=lambda: (mode.set("REGISTER"), submit())).pack(pady=4)
-        ctk.CTkLabel(win, text="Your username can be changed later without creating a new person.\nPasswords are stored as salted PBKDF2 hashes on the server.", font=(FONT_MONO, 9), text_color=FG_FAINT, justify="center").pack(pady=(18, 0))
+            if not name:
+                status.configure(text="Enter a username.", text_color=ERROR_RED)
+                username.focus_set()
+                return
+            if not pw:
+                status.configure(text="Enter a password.", text_color=ERROR_RED)
+                password.focus_set()
+                return
+
+            # Authentication always goes to the fixed NETRA main server.
+            self.server_host = DEFAULT_HOST
+            self.server_port = PORT
+            self.voice_port = VOICE_PORT
+            self.server_status_label.configure(
+                text="connecting...", text_color=FG_DIM
+            )
+            status.configure(
+                text="Connecting to NETRA...", text_color=FG_DIM
+            )
+            self.connect_and_auth(name, pw, selected_mode)
+
+        ctk.CTkButton(
+            win, text="LOGIN", width=145, height=40, corner_radius=0,
+            fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER,
+            text_color="black", font=(FONT_MONO, 12, "bold"),
+            command=lambda: (mode.set("LOGIN"), submit())
+        ).pack(pady=(2, 6))
+
+        ctk.CTkButton(
+            win, text="CREATE ACCOUNT", width=145, height=40,
+            corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER,
+            text_color=FG_BRIGHT, font=(FONT_MONO, 11, "bold"),
+            command=lambda: (mode.set("REGISTER"), submit())
+        ).pack(pady=4)
+
+        ctk.CTkLabel(
+            win,
+            text="Your account is stored on the NETRA main server.\n"
+                 "The server address is fixed internally and is not editable here.",
+            font=(FONT_MONO, 8), text_color=FG_FAINT,
+            justify="center"
+        ).pack(pady=(18, 0))
+
         username.focus_set()
+        username.bind("<Return>", lambda _e: password.focus_set())
+        password.bind("<Return>", lambda _e: submit())
 
     def connect_and_auth(self, username=None, password=None, mode="LOGIN"):
         username = (username if username is not None else self.username_entry.get()).strip()
@@ -1275,6 +1383,9 @@ class FullDiscordClone(ctk.CTk):
                         pass
                 set_key(ENV_FILE, "CHAT_USERNAME", name)
                 set_key(ENV_FILE, "NETRA_ACCOUNT_ID", self.account_id)
+                # Re-send the persisted PFP every login so the server has the
+                # current avatar for this account without another upload.
+                self.after(0, self.send_own_pfp)
                 self.after(0, self._finish_auth_window)
             return
         elif raw_message.startswith("AUTH_FAIL:"):
@@ -1439,41 +1550,109 @@ class FullDiscordClone(ctk.CTk):
         except Exception:
             pass
 
-    def store_and_render(self, chat_room, sender, text):
+    def _load_local_chat_cache(self):
+        """Load a local message cache so chat remains visible across restarts.
+
+        Server history is still accepted when available; this cache is a
+        fallback for channel messages when an older server has not implemented
+        channel-history replay yet.
+        """
+        try:
+            if not os.path.exists(CHAT_CACHE_FILE):
+                return
+            with open(CHAT_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            for room, messages in data.items():
+                if not isinstance(messages, list):
+                    continue
+                cleaned = []
+                for item in messages[-500:]:
+                    if isinstance(item, dict) and "sender" in item and "text" in item:
+                        cleaned.append({
+                            "id": str(item.get("id") or ""),
+                            "sender": str(item.get("sender", "")),
+                            "text": str(item.get("text", "")),
+                        })
+                if cleaned:
+                    self.chat_history[room] = cleaned
+        except Exception:
+            pass
+
+    def _save_local_chat_cache(self):
+        try:
+            data = {
+                room: messages[-500:]
+                for room, messages in self.chat_history.items()
+                if messages
+            }
+            tmp = CHAT_CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CHAT_CACHE_FILE)
+        except Exception:
+            pass
+
+    def store_and_render(self, chat_room, sender, text, local=False):
+        # Local messages are rendered immediately. A later server echo is
+        # suppressed so the message does not appear twice.
+        my_name = self.username_entry.get().strip()
+        pending_key = (chat_room, sender, text)
+        if not local and sender == my_name and pending_key in self._pending_local_messages:
+            self._pending_local_messages.discard(pending_key)
+            return
+
         if chat_room not in self.chat_history:
             self.chat_history[chat_room] = []
 
+        # Server history and the local cache can contain the same message.
+        # Don't render/save a duplicate when both sources replay it.
+        if any(m.get("sender") == sender and m.get("text") == text for m in self.chat_history[chat_room]):
+            if not local:
+                return
+
         import hashlib as _hashlib
-        msg_id = _hashlib.sha1(f"{chat_room}|{sender}|{text}|{len(self.chat_history.get(chat_room,[]))}".encode()).hexdigest()[:12]
+        msg_id = _hashlib.sha1(f"{chat_room}|{sender}|{text}".encode()).hexdigest()[:12]
         msg_data = {"id": msg_id, "sender": sender, "text": text}
         self.chat_history[chat_room].append(msg_data)
+        self.chat_history[chat_room] = self.chat_history[chat_room][-500:]
+        self._save_local_chat_cache()
 
-        if self.current_target != chat_room and sender != self.username_entry.get().strip():
-            self.unread_counts[chat_room]=self.unread_counts.get(chat_room,0)+1
-        if self.current_target == chat_room and not self.loading_history:
+        if self.current_target == chat_room and (local or not self.loading_history):
             self.render_single_message(sender, text, room=chat_room)
             self.chat_room_built.add(chat_room)
 
-        if self.sidebar_mode == "dms" and chat_room not in self.server_channels and not self.loading_history:
+        if self.current_target != chat_room and sender != my_name:
+            self.unread_counts[chat_room] = self.unread_counts.get(chat_room, 0) + 1
+        if self.sidebar_mode == "dms" and chat_room not in self.server_channels and (local or not self.loading_history):
             self.refresh_dm_list()
         self._refresh_unread_badges()
 
     def update_voice_users_ui(self, user_list):
-        normalized = list(dict.fromkeys(user_list))
+        normalized = list(dict.fromkeys(user_list or []))
+        my_name = self.username_entry.get().strip()
+        if self.in_voice_chat and my_name and my_name not in normalized:
+            normalized.insert(0, my_name)
         if normalized == self.last_voice_user_list:
             return
         self.last_voice_user_list = normalized
         for widget in self.voice_user_frame.winfo_children():
             widget.destroy()
 
-        if not user_list:
+        if not normalized:
             empty_label = ctk.CTkLabel(self.voice_user_frame, text="Nobody in voice", font=(FONT_MONO, 11), text_color=FG_FAINT)
             empty_label.pack(anchor="w", padx=10, pady=2)
             return
 
-        for user in user_list:
+        for user in normalized:
             avatar_img = self.get_avatar_ctkimage(user, size=(20, 20))
-            row = ctk.CTkLabel(self.voice_user_frame, image=avatar_img, text=f"  {user}", compound="left", font=(FONT_MONO, 12, "bold"), text_color=FG_BRIGHT, anchor="w")
+            label = f"  {'●' if user in self.online_user_set or user == my_name else '○'} {user}"
+            if user == my_name:
+                label += "  [YOU]"
+            row = ctk.CTkLabel(self.voice_user_frame, image=avatar_img, text=label, compound="left", font=(FONT_MONO, 11, "bold"), text_color=FG_BRIGHT, anchor="w")
             row.pack(fill="x", padx=10, pady=2)
 
     def update_online_presence_ui(self, user_list):
@@ -1483,21 +1662,27 @@ class FullDiscordClone(ctk.CTk):
     def update_online_users_ui(self, user_list, force=False):
         """Show every registered account with a live online/offline indicator."""
         normalized = sorted(list(dict.fromkeys([u for u in user_list if u])), key=str.lower)
+        my_name = self.username_entry.get().strip()
+        # The server is authoritative, but always keep the current account in
+        # the panel as a fallback.  This prevents a timing race where USERS:
+        # arrives before the main server has refreshed its account directory.
+        if my_name and my_name not in normalized:
+            normalized.append(my_name)
+            normalized.sort(key=str.lower)
         self.last_registered_user_list = normalized
         self.last_user_list = normalized
         search = self.member_search_var.get().strip().casefold() if hasattr(self, "member_search_var") else ""
-        my_name = self.username_entry.get().strip()
-        visible = [u for u in normalized if u != my_name and (not search or search in u.casefold())]
+        visible = [u for u in normalized if (not search or search in u.casefold())]
         for widget in self.user_list_frame.winfo_children():
             widget.destroy()
         if not visible:
-            ctk.CTkLabel(self.user_list_frame, text="No matching members" if search else "No other members", font=(FONT_MONO, 10), text_color=FG_FAINT, anchor="w").pack(fill="x", padx=8, pady=8)
+            ctk.CTkLabel(self.user_list_frame, text="No matching members" if search else "No members", font=(FONT_MONO, 10), text_color=FG_FAINT, anchor="w").pack(fill="x", padx=8, pady=8)
         else:
             for user in visible:
                 online = user in self.online_user_set
                 status = "●" if online else "○"
                 avatar_img = self.get_avatar_ctkimage(user, size=(24, 24))
-                btn = ctk.CTkButton(self.user_list_frame, image=avatar_img, text=f"  {status} {user}", compound="left", font=(FONT_MONO, 10, "bold"), corner_radius=0, fg_color=(BTN_HOVER if user == self.current_target else "transparent"), text_color=(FG_BRIGHT if online else FG_DIM), anchor="w", height=34, hover_color=BTN_HOVER, command=lambda u=user: self.select_dm_channel(u))
+                btn = ctk.CTkButton(self.user_list_frame, image=avatar_img, text=f"  {status} {user}" + ("  [YOU]" if user == my_name else ""), compound="left", font=(FONT_MONO, 10, "bold"), corner_radius=0, fg_color=(BTN_HOVER if user == self.current_target else "transparent"), text_color=(FG_BRIGHT if online else FG_DIM), anchor="w", height=34, hover_color=BTN_HOVER, command=lambda u=user: self.select_dm_channel(u))
                 btn.pack(fill="x", padx=4, pady=1)
         if self.sidebar_mode == "dms":
             self.refresh_dm_list()
@@ -1603,13 +1788,47 @@ class FullDiscordClone(ctk.CTk):
         except Exception: pass
 
     def send_message(self):
-        message=self.message_entry.get().strip()
-        if not message or not self.client_socket or not self.authenticated: return
-        self.draft_messages.pop(self.current_target,None); self.message_entry.delete(0,'end')
-        if self.current_target in self.server_channels: payload=f"CHANNEL:{self.current_target}:{message}\n"
-        else: payload=f"DM:{self.current_target}:{message}\n"
-        try: self.client_socket.sendall(payload.encode('utf-8'))
-        except Exception as e: self.append_system_error(f"Message delivery lost: {e}")
+        message = self.message_entry.get().strip()
+        if not message:
+            return
+
+        if not self.client_socket:
+            self.append_system_error("Cannot send message: not connected to NETRA server.")
+            return
+        if not self.authenticated:
+            self.append_system_error("Cannot send message: you are not authenticated.")
+            return
+
+        room = self.current_target
+        my_name = self.username_entry.get().strip()
+        if not my_name:
+            self.append_system_error("Cannot send message: no username is loaded.")
+            return
+
+        # Render locally first. The local=True flag is important: without it,
+        # the pending-echo protection would accidentally hide our own message.
+        pending_key = (room, my_name, message)
+        self._pending_local_messages.add(pending_key)
+        self.store_and_render(room, my_name, message, local=True)
+
+        self.draft_messages.pop(room, None)
+        self.message_entry.delete(0, 'end')
+
+        if room == "general-chat":
+            # Backwards-compatible with the current NETRA main server, which
+            # stores the main room under its legacy GLOBAL history key.
+            payload = f"GLOBAL:{message}\n"
+        elif room in self.server_channels:
+            payload = f"CHANNEL:{room}:{message}\n"
+        else:
+            payload = f"DM:{room}:{message}\n"
+
+        try:
+            self.client_socket.sendall(payload.encode('utf-8'))
+        except Exception as e:
+            self._pending_local_messages.discard(pending_key)
+            self.append_system_error(f"Message delivery lost: {e}")
+
         self._refresh_unread_badges()
 
     def open_netra_hub(self):
@@ -1686,7 +1905,8 @@ class FullDiscordClone(ctk.CTk):
         ctk.CTkButton(win,text='REFRESH',command=refresh,fg_color=FG_DIM,text_color='black').pack(pady=(0,12)); refresh()
 
     def connect_to_server_address(self,hostport):
-        self.server_ip_entry.delete(0,'end'); self.server_ip_entry.insert(0,hostport); self.connect_to_server_from_bar()
+        # Ignore server-browser addresses; NETRA uses the fixed main server.
+        self.connect_to_server_from_bar()
 
     def send_reaction(self,room,text,emoji='👍'):
         import hashlib as _h; key=_h.sha1(f'{room}|{text}'.encode()).hexdigest()[:12]
@@ -1794,6 +2014,7 @@ class FullDiscordClone(ctk.CTk):
 
             self.in_voice_chat = True
             self.voice_btn.configure(text="🎤 Leave Voice", fg_color=BTN_ACTIVE_BG, hover_color=BTN_ACTIVE_HOVER, text_color="black")
+            self.after(0, self.update_voice_users_ui, self.last_voice_user_list)
 
             # Tell the server over TCP too, so "who's in voice" works even if
             # the UDP voice port isn't forwarded on your router.
@@ -1847,6 +2068,10 @@ class FullDiscordClone(ctk.CTk):
 
     def stop_voice_chat(self):
         self.in_voice_chat = False
+        try:
+            self.update_voice_users_ui([u for u in self.last_voice_user_list if u != self.username_entry.get().strip()])
+        except Exception:
+            pass
         try:
             if self.client_socket:
                 self.client_socket.sendall(b"VOICELEAVE:1\n")

@@ -274,11 +274,17 @@ def handle_client(connection, address):
         print(f"[ERROR] Exception with client {username or address}: {e}")
     finally:
         if username:
+            # Only remove the session if this exact socket is still the
+            # connection registered for the username.  This prevents an old
+            # connection from marking a freshly reconnected user offline.
+            was_current_connection = False
             with clients_lock:
-                if username in clients:
+                if clients.get(username) is connection:
                     del clients[username]
-            print(f"[DISCONNECT] {username} left.")
-            broadcast_user_list()
+                    was_current_connection = True
+            if was_current_connection:
+                print(f"[DISCONNECT] {username} left.")
+                broadcast_user_list()
 
             # Clean up voice presence / stale audio registration for this user
             removed_presence = False
@@ -313,7 +319,12 @@ def process_line(message, username, connection, address):
             accounts.setdefault(aid,{"username":username,"username_normalized":normalize_username(username)})
             username_to_account[normalize_username(username)]=aid
         with clients_lock:
-            old_conn=clients.get(username); clients[username]=connection
+            # Keep exactly one live TCP connection per username.  If a user
+            # reconnects quickly, the old connection may finish shutting down
+            # after the new one is already registered.  The disconnect handler
+            # checks the socket identity so it cannot remove the new session.
+            old_conn=clients.get(username)
+            clients[username]=connection
             existing_pfps=dict(clients_pfp); current_server_icon=server_icon_b64
             online_names=sorted(clients.keys(),key=str.lower)
         if old_conn is not None and old_conn is not connection:
