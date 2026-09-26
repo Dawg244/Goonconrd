@@ -1,6 +1,6 @@
 import socket
 
-host = "192.168.1.50"
+host = "192.168.1.223"
 port = 12145
 
 print(("As of now, the project has no UI (yet) but I am working on it."))
