@@ -2,5 +2,6 @@
   "dm_sound_mode": "ping_4",
   "dm_sound_path": "C:/Users/Leo/Downloads/oxp.wav",
   "voice_input_device": 17,
-  "voice_output_device": 39
+  "voice_output_device": 39,
+  "theme": "CRT Amber"
 }

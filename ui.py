@@ -42,7 +42,7 @@ ENV_FILE = os.path.join(CONFIG_DIR, ".env")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 load_dotenv(ENV_FILE, override=True)
 
-DEFAULT_HOST = '216.110.170.248'
+DEFAULT_HOST = '108.221.36.120'
 PORT = 12155
 VOICE_PORT = 12156
 MAIN_PORT = 12145
@@ -153,12 +153,52 @@ def generate_ping_wav(style="ping"):
     return path
 
 
+THEMES = {
+    "NETRA Terminal": {
+        "root": "#050A05", "rail": "#020402", "panel": "#0A140A",
+        "panel_alt": "#0E1C0E", "input": "#0C1A0C", "bright": "#33FF33",
+        "dim": "#1E8C1E", "faint": "#145214", "border": "#123312",
+        "button": "#0F1F0F", "hover": "#1B3D1B", "active": "#33FF33",
+        "active_hover": "#29CC29", "error": "#FF5555", "appearance": "Dark"
+    },
+    "Midnight": {
+        "root": "#080B14", "rail": "#050711", "panel": "#0D1220",
+        "panel_alt": "#12192A", "input": "#101729", "bright": "#62B0FF",
+        "dim": "#3B78B5", "faint": "#29435F", "border": "#1E3550",
+        "button": "#121D30", "hover": "#1B3150", "active": "#62B0FF",
+        "active_hover": "#3D8FE0", "error": "#FF667A", "appearance": "Dark"
+    },
+    "Light": {
+        "root": "#E9EDF2", "rail": "#D7DDE5", "panel": "#F6F8FA",
+        "panel_alt": "#E1E6ED", "input": "#FFFFFF", "bright": "#146CDA",
+        "dim": "#3D6F9F", "faint": "#718096", "border": "#B8C2CF",
+        "button": "#DCE4ED", "hover": "#C9D8E8", "active": "#146CDA",
+        "active_hover": "#0F5BB9", "error": "#C62828", "appearance": "Light"
+    },
+    "CRT Amber": {
+        "root": "#090704", "rail": "#050402", "panel": "#151008",
+        "panel_alt": "#1C150B", "input": "#120D06", "bright": "#FFB000",
+        "dim": "#A87300", "faint": "#664900", "border": "#4A3400",
+        "button": "#1B1408", "hover": "#332308", "active": "#FFB000",
+        "active_hover": "#D99300", "error": "#FF5F56", "appearance": "Dark"
+    },
+    "Violet": {
+        "root": "#0B0710", "rail": "#06040A", "panel": "#140D1C",
+        "panel_alt": "#1D1328", "input": "#160E20", "bright": "#D18BFF",
+        "dim": "#8D5BB0", "faint": "#593A70", "border": "#412852",
+        "button": "#1B1025", "hover": "#302044", "active": "#D18BFF",
+        "active_hover": "#A962D5", "error": "#FF668F", "appearance": "Dark"
+    },
+}
+
+
 def load_persistent_settings():
     defaults = {
         "dm_sound_mode": "ping",
         "dm_sound_path": "",
         "voice_input_device": None,
         "voice_output_device": None,
+        "theme": "NETRA Terminal",
     }
     try:
         if os.path.exists(SETTINGS_FILE):
@@ -229,6 +269,10 @@ class FullDiscordClone(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        saved = load_persistent_settings()
+        self.theme_name = saved.get("theme", "NETRA Terminal") if saved.get("theme") in THEMES else "NETRA Terminal"
+        self._apply_theme_palette(self.theme_name, update_widgets=False)
+
         self.title("NETRA // TERMINAL")
         self.geometry("1000x600")
         self.resizable(False, False)
@@ -284,7 +328,6 @@ class FullDiscordClone(ctk.CTk):
         self.voice_device_input = None
         self.voice_device_output = None
         self.voice_muted = False
-        saved = load_persistent_settings()
         self.dm_sound_mode = saved["dm_sound_mode"]
         self.dm_sound_path = saved["dm_sound_path"]
         self.voice_device_input = saved["voice_input_device"]
@@ -627,6 +670,141 @@ class FullDiscordClone(ctk.CTk):
         except Exception:
             pass
 
+    # ---------- Themes ----------
+
+    def _apply_theme_palette(self, theme_name, update_widgets=True):
+        global BG_ROOT, BG_RAIL, BG_PANEL, BG_PANEL_ALT, BG_INPUT
+        global FG_BRIGHT, FG_DIM, FG_FAINT, BORDER_GREEN, BTN_BG, BTN_HOVER
+        global BTN_ACTIVE_BG, BTN_ACTIVE_HOVER, ERROR_RED
+
+        palette = THEMES.get(theme_name, THEMES["NETRA Terminal"])
+        old = {
+            "root": BG_ROOT, "rail": BG_RAIL, "panel": BG_PANEL, "panel_alt": BG_PANEL_ALT,
+            "input": BG_INPUT, "bright": FG_BRIGHT, "dim": FG_DIM, "faint": FG_FAINT,
+            "border": BORDER_GREEN, "button": BTN_BG, "hover": BTN_HOVER,
+            "active": BTN_ACTIVE_BG, "active_hover": BTN_ACTIVE_HOVER, "error": ERROR_RED,
+        }
+
+        BG_ROOT = palette["root"]; BG_RAIL = palette["rail"]; BG_PANEL = palette["panel"]
+        BG_PANEL_ALT = palette["panel_alt"]; BG_INPUT = palette["input"]
+        FG_BRIGHT = palette["bright"]; FG_DIM = palette["dim"]; FG_FAINT = palette["faint"]
+        BORDER_GREEN = palette["border"]; BTN_BG = palette["button"]; BTN_HOVER = palette["hover"]
+        BTN_ACTIVE_BG = palette["active"]; BTN_ACTIVE_HOVER = palette["active_hover"]; ERROR_RED = palette["error"]
+        ctk.set_appearance_mode(palette.get("appearance", "Dark"))
+        self.theme_name = theme_name
+
+        if not update_widgets:
+            return
+
+        frame_map = {old["root"]: BG_ROOT, old["rail"]: BG_RAIL, old["panel"]: BG_PANEL,
+                     old["panel_alt"]: BG_PANEL_ALT, old["input"]: BG_INPUT}
+        text_map = {old["bright"]: FG_BRIGHT, old["dim"]: FG_DIM, old["faint"]: FG_FAINT, old["error"]: ERROR_RED}
+        color_map = {**frame_map, old["button"]: BTN_BG, old["hover"]: BTN_HOVER,
+                     old["active"]: BTN_ACTIVE_BG, old["active_hover"]: BTN_ACTIVE_HOVER,
+                     old["border"]: BORDER_GREEN, **text_map}
+
+        def mapped(value):
+            if isinstance(value, tuple):
+                return value
+            return color_map.get(value, value)
+
+        def update_widget(widget):
+            try:
+                cls = widget.__class__.__name__
+                if cls in ("CTkFrame", "CTkScrollableFrame"):
+                    value = widget.cget("fg_color")
+                    if value in frame_map:
+                        widget.configure(fg_color=frame_map[value])
+                elif cls == "CTkButton":
+                    fg = widget.cget("fg_color")
+                    hover = widget.cget("hover_color")
+                    txt = widget.cget("text_color")
+                    widget.configure(fg_color=mapped(fg), hover_color=mapped(hover), text_color=mapped(txt))
+                elif cls == "CTkLabel":
+                    widget.configure(text_color=mapped(widget.cget("text_color")))
+                elif cls == "CTkEntry":
+                    widget.configure(fg_color=mapped(widget.cget("fg_color")), border_color=mapped(widget.cget("border_color")), text_color=mapped(widget.cget("text_color")))
+                elif cls == "CTkOptionMenu":
+                    widget.configure(fg_color=mapped(widget.cget("fg_color")), button_color=mapped(widget.cget("button_color")), button_hover_color=mapped(widget.cget("button_hover_color")), text_color=mapped(widget.cget("text_color")))
+                elif cls == "CTkCheckBox":
+                    widget.configure(fg_color=mapped(widget.cget("fg_color")), hover_color=mapped(widget.cget("hover_color")), text_color=mapped(widget.cget("text_color")))
+            except Exception:
+                pass
+            try:
+                for child in widget.winfo_children():
+                    update_widget(child)
+            except Exception:
+                pass
+
+        try:
+            for top in self.winfo_toplevel().winfo_children():
+                update_widget(top)
+            self.configure(fg_color=BG_ROOT)
+            for top in self.winfo_toplevel().winfo_children():
+                try: top.configure(fg_color=BG_ROOT)
+                except Exception: pass
+        except Exception:
+            pass
+
+    def apply_theme(self, theme_name):
+        if theme_name not in THEMES:
+            return
+        self._apply_theme_palette(theme_name, update_widgets=True)
+        self._save_theme_preference()
+
+    def _save_theme_preference(self):
+        try:
+            data = load_persistent_settings()
+            data["theme"] = self.theme_name
+            save_persistent_settings(data)
+        except Exception:
+            pass
+
+    def open_themes(self):
+        win = ctk.CTkToplevel(self)
+        win.title("NETRA // THEMES")
+        win.geometry("520x430")
+        win.resizable(False, False)
+        win.configure(fg_color=BG_ROOT)
+        win.transient(self)
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="NETRA // THEMES", font=(FONT_MONO, 18, "bold"), text_color=FG_BRIGHT).pack(pady=(22, 5))
+        ctk.CTkLabel(win, text="Pick a theme and it changes the actual interface immediately.", font=(FONT_MONO, 9), text_color=FG_DIM).pack(pady=(0, 18))
+
+        var = ctk.StringVar(value=self.theme_name)
+        menu = ctk.CTkOptionMenu(win, variable=var, values=list(THEMES.keys()), width=320, height=38,
+                                 fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER,
+                                 text_color=FG_BRIGHT, font=(FONT_MONO, 11, "bold"))
+        menu.pack(pady=8)
+
+        preview = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=0, width=400, height=120)
+        preview.pack(padx=35, pady=15, fill="x")
+        preview.pack_propagate(False)
+        preview_title = ctk.CTkLabel(preview, text="THEME PREVIEW", font=(FONT_MONO, 12, "bold"), text_color=FG_BRIGHT)
+        preview_title.pack(pady=(18, 5))
+        preview_text = ctk.CTkLabel(preview, text="Buttons, panels, text, inputs and windows all update.", font=(FONT_MONO, 9), text_color=FG_DIM)
+        preview_text.pack()
+
+        def refresh_preview():
+            # Preview follows the currently selected palette without changing the app yet.
+            pal = THEMES.get(var.get(), THEMES["NETRA Terminal"])
+            preview.configure(fg_color=pal["panel"])
+            preview_title.configure(text_color=pal["bright"])
+            preview_text.configure(text_color=pal["dim"])
+
+        menu.configure(command=lambda _choice: refresh_preview())
+        refresh_preview()
+
+        buttons = ctk.CTkFrame(win, fg_color="transparent")
+        buttons.pack(pady=10)
+        ctk.CTkButton(buttons, text="APPLY THEME", width=180, height=38, corner_radius=0,
+                      fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black",
+                      font=(FONT_MONO, 11, "bold"), command=lambda: (self.apply_theme(var.get()), win.destroy())).pack(side="left", padx=6)
+        ctk.CTkButton(buttons, text="CANCEL", width=120, height=38, corner_radius=0,
+                      fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT,
+                      font=(FONT_MONO, 10, "bold"), command=win.destroy).pack(side="left", padx=6)
+
     # ---------- Sound ----------
 
     def save_settings_file(self, dm_mode, dm_path, input_device, output_device):
@@ -635,6 +813,7 @@ class FullDiscordClone(ctk.CTk):
             "dm_sound_path": dm_path,
             "voice_input_device": input_device,
             "voice_output_device": output_device,
+            "theme": self.theme_name,
         }
         try:
             save_persistent_settings(data)
@@ -818,7 +997,7 @@ class FullDiscordClone(ctk.CTk):
         win = ctk.CTkToplevel(self)
         self.auth_window = win
         win.title("NETRA // Account")
-        win.geometry("430x430")
+        win.geometry("430x520")
         win.resizable(False, False)
         win.configure(fg_color=BG_PANEL)
         win.transient(self)
@@ -826,7 +1005,57 @@ class FullDiscordClone(ctk.CTk):
         win.protocol("WM_DELETE_WINDOW", self.on_close)
 
         ctk.CTkLabel(win, text="NETRA // ACCOUNT", font=(FONT_MONO, 22, "bold"), text_color=FG_BRIGHT).pack(pady=(28, 4))
-        ctk.CTkLabel(win, text="Sign in to your permanent NETRA identity", font=(FONT_MONO, 11), text_color=FG_DIM).pack(pady=(0, 22))
+        ctk.CTkLabel(win, text="Sign in to your permanent NETRA identity", font=(FONT_MONO, 11), text_color=FG_DIM).pack(pady=(0, 12))
+
+        # Server selection is intentionally available BEFORE authentication so a
+        # user is never trapped on a stale/saved server address.
+        ctk.CTkLabel(win, text="SERVER ADDRESS", font=(FONT_MONO, 9, "bold"), text_color=FG_DIM).pack(pady=(2, 4))
+        server_entry = ctk.CTkEntry(
+            win, width=320, height=38, corner_radius=0,
+            fg_color=BG_INPUT, border_color=BORDER_GREEN,
+            text_color=FG_BRIGHT, font=(FONT_MONO, 12)
+        )
+        server_entry.insert(0, f"{self.server_host}:{self.server_port}")
+        server_entry.pack(pady=(0, 5))
+
+        server_status = ctk.CTkLabel(win, text="", font=(FONT_MONO, 8), text_color=FG_DIM)
+        server_status.pack(pady=(0, 8))
+
+        def apply_server():
+            raw = server_entry.get().strip()
+            if not raw:
+                server_status.configure(text="Enter a server address.", text_color=ERROR_RED)
+                return
+            new_host = raw
+            new_port = PORT
+            if ":" in raw and raw.count(":") == 1:
+                candidate_host, candidate_port = raw.rsplit(":", 1)
+                if candidate_port.isdigit():
+                    new_host = candidate_host.strip()
+                    new_port = int(candidate_port)
+            new_host = new_host.strip()
+            if not new_host:
+                server_status.configure(text="Invalid server address.", text_color=ERROR_RED)
+                return
+            self.server_host = new_host
+            self.server_port = new_port
+            self.voice_port = new_port + 1
+            try:
+                set_key(ENV_FILE, "NETRA_SERVER_IP", f"{new_host}:{new_port}")
+            except Exception:
+                pass
+            self.server_ip_entry.delete(0, "end")
+            self.server_ip_entry.insert(0, f"{new_host}:{new_port}")
+            self.server_ip_small.configure(text=f"{new_host}:{new_port}")
+            server_status.configure(text=f"Using {new_host}:{new_port}", text_color=FG_DIM)
+            if getattr(self, "_auth_status_label", None):
+                self._auth_status_label.configure(text="")
+
+        ctk.CTkButton(
+            win, text="USE SERVER", width=145, height=32, corner_radius=0,
+            fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT,
+            font=(FONT_MONO, 10, "bold"), command=apply_server
+        ).pack(pady=(0, 8))
 
         mode = ctk.StringVar(value="LOGIN")
         username = ctk.CTkEntry(win, placeholder_text="Username", width=320, height=42, corner_radius=0, fg_color=BG_INPUT, border_color=BORDER_GREEN, text_color=FG_BRIGHT, font=(FONT_MONO, 13))
@@ -1340,9 +1569,6 @@ class FullDiscordClone(ctk.CTk):
         pins=[]
         for room,arr in self.pinned_messages.items(): pins += [f'[{room}] {x}' for x in arr]
         self.simple_window('NETRA // PINNED MESSAGES',pins or ['No pinned messages in this session.'],size='500x400')
-
-    def open_themes(self):
-        self.simple_window('NETRA // THEMES',['Current theme: NETRA Terminal','CRT scanlines and accent customization are ready for the UI layer.'],size='460x240')
 
     def open_channel_tools(self):
         win=ctk.CTkToplevel(self); win.title('NETRA // SERVER TOOLS'); win.geometry('440x360'); win.configure(fg_color=BG_ROOT)
