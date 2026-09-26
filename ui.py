@@ -116,6 +116,7 @@ class FullDiscordClone(ctk.CTk):
                 set_key(ENV_FILE, "CHAT_PFP_PATH", file_path)
             except Exception as e:
                 self.append_system_error(f"Failed to load image: {e}")
+
     def connect_and_auth(self):
         username = self.username_entry.get().strip()
         if not username:
@@ -135,43 +136,48 @@ class FullDiscordClone(ctk.CTk):
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((HOST, PORT))
-            self.client_socket.sendall(f"AUTH:{username}".encode('utf-8'))
+            self.client_socket.sendall(f"AUTH:{username}\n".encode('utf-8'))
             threading.Thread(target=self.receive_messages_loop, daemon=True).start()
         except Exception as e:
             self.append_system_error(f"Could not link to server at {HOST}: {e}")
 
     def receive_messages_loop(self):
+        buffer = ""  # accumulates partial data between recv() calls
         while True:
             try:
                 data = self.client_socket.recv(4096)
                 if not data:
                     break
-                raw_messages = data.decode('utf-8').split("\n")
-                
-                for raw_message in raw_messages:
+                buffer += data.decode('utf-8')
+
+                # A recv() can contain 0, 1, or several complete lines.
+                # Only process complete lines; keep any trailing partial
+                # line in the buffer for the next recv().
+                while "\n" in buffer:
+                    raw_message, buffer = buffer.split("\n", 1)
                     if not raw_message:
                         continue
-                    if raw_message.startswith("USERS:"):
-                        users_raw = raw_message.split(":", 1)
-                        if len(users_raw) == 2:
-                            user_list = [u for u in users_raw[1].split(",") if u]
-                            self.after(0, self.update_online_users_ui, user_list)
-                    elif raw_message.startswith("GLOBAL:"):
-                        parts = raw_message.split(":", 2)
-                        if len(parts) == 3:
-                            sender = parts[1]
-                            text = parts[2]
-                            self.after(0, self.store_and_render, "GLOBAL", sender, text)
-                    elif raw_message.startswith("DM:"):
-                        parts = raw_message.split(":", 2)
-                        if len(parts) == 3:
-                            sender = parts[1]
-                            text = parts[2]
-                            my_name = self.username_entry.get().strip()
-                            chat_room = sender if sender != my_name else self.current_target
-                            self.after(0, self.store_and_render, chat_room, sender, text)
+                    self.handle_incoming_line(raw_message)
             except:
                 break
+
+    def handle_incoming_line(self, raw_message):
+        if raw_message.startswith("USERS:"):
+            users_raw = raw_message.split(":", 1)[1]
+            user_list = [u for u in users_raw.split(",") if u]
+            self.after(0, self.update_online_users_ui, user_list)
+        elif raw_message.startswith("GLOBAL:"):
+            parts = raw_message.split(":", 2)
+            if len(parts) == 3:
+                sender, text = parts[1], parts[2]
+                self.after(0, self.store_and_render, "GLOBAL", sender, text)
+        elif raw_message.startswith("DM:"):
+            parts = raw_message.split(":", 2)
+            if len(parts) == 3:
+                sender, text = parts[1], parts[2]
+                my_name = self.username_entry.get().strip()
+                chat_room = sender if sender != my_name else self.current_target
+                self.after(0, self.store_and_render, chat_room, sender, text)
 
     def store_and_render(self, chat_room, sender, text):
         if chat_room not in self.chat_history:
