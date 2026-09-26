@@ -9,6 +9,7 @@ import wave
 import tempfile
 import subprocess
 import base64
+import json
 import customtkinter as ctk
 from tkinter import filedialog
 from PIL import Image
@@ -22,6 +23,7 @@ except ImportError:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 load_dotenv(ENV_FILE, override=True)
 
 HOST = '108.221.36.120'
@@ -52,32 +54,66 @@ BTN_ACTIVE_HOVER = "#29CC29"
 ERROR_RED = "#FF5555"
 
 
-def generate_ping_wav():
-    """Builds (once) a short beep .wav in the temp dir and returns its path."""
-    path = os.path.join(tempfile.gettempdir(), "discordlite_ping.wav")
+def generate_ping_wav(style="ping"):
+    """Generate one of several built-in notification sounds."""
+    sounds = {
+        "ping": (880, 0.15, 0.30),
+        "ping_2": (660, 0.18, 0.28),
+        "ping_3": (1047, 0.12, 0.28),
+        "ping_4": (523, 0.22, 0.26),
+        "ping_5": (740, 0.20, 0.30),
+    }
+    freq, duration, volume = sounds.get(style, sounds["ping"])
+    path = os.path.join(tempfile.gettempdir(), f"netra_{style}.wav")
     if os.path.exists(path):
         return path
     framerate = 44100
-    duration = 0.15
-    freq = 880.0
     n_samples = int(framerate * duration)
-    with wave.open(path, 'w') as wf:
+    with wave.open(path, "w") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(framerate)
         frames = bytearray()
         for i in range(n_samples):
-            value = int(32767 * 0.3 * math.sin(2 * math.pi * freq * (i / framerate)))
-            frames += struct.pack('<h', value)
+            # Small fade-in/out keeps the notification from clicking.
+            t = i / framerate
+            fade = min(1.0, i / (framerate * 0.01), (n_samples - i) / (framerate * 0.02))
+            value = int(32767 * volume * fade * math.sin(2 * math.pi * freq * t))
+            frames += struct.pack("<h", value)
         wf.writeframes(bytes(frames))
     return path
+
+
+def load_persistent_settings():
+    defaults = {
+        "dm_sound_mode": "ping",
+        "dm_sound_path": "",
+        "voice_input_device": None,
+        "voice_output_device": None,
+    }
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                defaults.update({k: data[k] for k in defaults if k in data})
+    except Exception:
+        pass
+    return defaults
+
+
+def save_persistent_settings(data):
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
 
 
 class FullDiscordClone(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Discord Lite // TERMINAL")
+        self.title("NETRA // TERMINAL")
         self.geometry("1000x600")
         self.resizable(False, False)
         self.configure(fg_color=BG_ROOT)
@@ -106,10 +142,11 @@ class FullDiscordClone(ctk.CTk):
         self.voice_device_input = None
         self.voice_device_output = None
         self.voice_muted = False
-        self.dm_sound_mode = os.getenv("DM_SOUND", "ping")
-        self.dm_sound_path = os.getenv("DM_SOUND_PATH", "")
-        self.voice_device_input = os.getenv("VOICE_INPUT_DEVICE", "") or None
-        self.voice_device_output = os.getenv("VOICE_OUTPUT_DEVICE", "") or None
+        saved = load_persistent_settings()
+        self.dm_sound_mode = saved["dm_sound_mode"]
+        self.dm_sound_path = saved["dm_sound_path"]
+        self.voice_device_input = saved["voice_input_device"]
+        self.voice_device_output = saved["voice_output_device"]
         self.loading_history = True
         self._history_ready = False
 
@@ -129,7 +166,7 @@ class FullDiscordClone(ctk.CTk):
         self.channel_sidebar = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color=BG_PANEL)
         self.channel_sidebar.pack(side="left", fill="y")
 
-        self.server_title = ctk.CTkLabel(self.channel_sidebar, text="Main Server", font=(FONT_MONO, 14, "bold"), text_color=FG_BRIGHT)
+        self.server_title = ctk.CTkLabel(self.channel_sidebar, text="NETRA // Main Server", font=(FONT_MONO, 14, "bold"), text_color=FG_BRIGHT)
         self.server_title.pack(pady=15, padx=15, anchor="w")
 
         self.sidebar_body = ctk.CTkFrame(self.channel_sidebar, fg_color="transparent", corner_radius=0)
@@ -367,14 +404,23 @@ class FullDiscordClone(ctk.CTk):
 
     # ---------- Sound ----------
 
-    def _save_setting(self, key, value):
+    def save_settings_file(self, dm_mode, dm_path, input_device, output_device):
+        data = {
+            "dm_sound_mode": dm_mode,
+            "dm_sound_path": dm_path,
+            "voice_input_device": input_device,
+            "voice_output_device": output_device,
+        }
         try:
-            if not os.path.exists(ENV_FILE):
-                open(ENV_FILE, "w").close()
-            set_key(ENV_FILE, key, str(value), quote_mode="auto")
-            os.environ[key] = str(value)
+            save_persistent_settings(data)
+            self.dm_sound_mode = dm_mode
+            self.dm_sound_path = dm_path
+            self.voice_device_input = input_device
+            self.voice_device_output = output_device
+            return True
         except Exception as e:
-            self.append_system_error(f"Could not save setting: {e}")
+            self.append_system_error(f"Could not save settings: {e}")
+            return False
 
     def play_ping_sound(self):
         """Play the configured DM notification sound without blocking the UI."""
@@ -384,7 +430,7 @@ class FullDiscordClone(ctk.CTk):
             if self.dm_sound_mode == "custom" and self.dm_sound_path and os.path.exists(self.dm_sound_path):
                 path = self.dm_sound_path
             else:
-                path = generate_ping_wav()
+                path = generate_ping_wav(self.dm_sound_mode)
             if os.name == "nt":
                 import winsound
                 winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -397,86 +443,82 @@ class FullDiscordClone(ctk.CTk):
 
     def open_settings(self):
         win = ctk.CTkToplevel(self)
-        win.title("Settings")
-        win.geometry("520x430")
+        win.title("NETRA // Settings")
+        win.geometry("560x570")
         win.resizable(False, False)
         win.configure(fg_color=BG_ROOT)
         win.transient(self)
         win.grab_set()
 
-        title = ctk.CTkLabel(win, text="CLIENT SETTINGS", font=(FONT_MONO, 16, "bold"), text_color=FG_BRIGHT)
-        title.pack(pady=(18, 12))
+        ctk.CTkLabel(win, text="NETRA // SETTINGS", font=(FONT_MONO, 16, "bold"), text_color=FG_BRIGHT).pack(pady=(18, 12))
 
-        # DM notification sound
         sound_frame = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=0)
         sound_frame.pack(fill="x", padx=20, pady=8)
-        ctk.CTkLabel(sound_frame, text="DM notification sound", font=(FONT_MONO, 11, "bold"),
-                     text_color=FG_BRIGHT).pack(anchor="w", padx=12, pady=(10, 4))
+        ctk.CTkLabel(sound_frame, text="DM NOTIFICATIONS", font=(FONT_MONO, 11, "bold"), text_color=FG_BRIGHT).pack(anchor="w", padx=12, pady=(10, 5))
         sound_var = ctk.StringVar(value=self.dm_sound_mode)
-        sound_menu = ctk.CTkOptionMenu(
-            sound_frame, variable=sound_var,
-            values=["ping", "custom", "off"], width=180,
-            fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER,
-            text_color=FG_BRIGHT, font=(FONT_MONO, 10)
-        )
+        sound_menu = ctk.CTkOptionMenu(sound_frame, variable=sound_var, values=["ping", "ping_2", "ping_3", "ping_4", "ping_5", "custom", "off"], width=220, fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 10))
         sound_menu.pack(anchor="w", padx=12, pady=(0, 8))
-        sound_path_label = ctk.CTkLabel(sound_frame, text=self.dm_sound_path or "No custom sound selected",
-                                        font=(FONT_MONO, 9), text_color=FG_FAINT)
-        sound_path_label.pack(anchor="w", padx=12, pady=(0, 8))
+        sound_path_label = ctk.CTkLabel(sound_frame, text=self.dm_sound_path or "Built-in notification", font=(FONT_MONO, 9), text_color=FG_FAINT)
+        sound_path_label.pack(anchor="w", padx=12, pady=(0, 6))
 
         def choose_sound():
-            path = filedialog.askopenfilename(
-                title="Choose DM notification sound",
-                filetypes=[("WAV audio", "*.wav"), ("Audio files", "*.wav *.mp3 *.ogg"), ("All files", "*.*")]
-            )
+            path = filedialog.askopenfilename(title="Choose DM notification sound", filetypes=[("WAV audio", "*.wav"), ("Audio files", "*.wav *.mp3 *.ogg"), ("All files", "*.*")])
             if path:
-                self.dm_sound_path = path
-                self.dm_sound_mode = "custom"
                 sound_var.set("custom")
+                self.dm_sound_path = path
                 sound_path_label.configure(text=path)
 
-        ctk.CTkButton(sound_frame, text="CHOOSE WAV", command=choose_sound,
-                      width=120, height=28, corner_radius=0, fg_color=BTN_BG,
-                      hover_color=BTN_HOVER, text_color=FG_BRIGHT,
-                      font=(FONT_MONO, 10, "bold")).pack(anchor="w", padx=12, pady=(0, 10))
+        ctk.CTkButton(sound_frame, text="CHOOSE CUSTOM WAV", command=choose_sound, width=170, height=28, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 10, "bold")).pack(anchor="w", padx=12, pady=(0, 5))
 
-        # Voice devices
+        def test_sound():
+            old_mode, old_path = self.dm_sound_mode, self.dm_sound_path
+            self.dm_sound_mode = sound_var.get()
+            if self.dm_sound_mode == "custom":
+                self.dm_sound_path = self.dm_sound_path
+            self.play_ping_sound()
+            self.dm_sound_mode, self.dm_sound_path = old_mode, old_path
+
+        ctk.CTkButton(sound_frame, text="🔊 TEST SOUND", command=test_sound, width=140, height=26, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9, "bold")).pack(anchor="w", padx=12, pady=(0, 10))
+
         voice_frame = ctk.CTkFrame(win, fg_color=BG_PANEL, corner_radius=0)
         voice_frame.pack(fill="x", padx=20, pady=8)
-        ctk.CTkLabel(voice_frame, text="VOICE DEVICES", font=(FONT_MONO, 11, "bold"),
-                     text_color=FG_BRIGHT).pack(anchor="w", padx=12, pady=(10, 6))
-
+        ctk.CTkLabel(voice_frame, text="VOICE DEVICES", font=(FONT_MONO, 11, "bold"), text_color=FG_BRIGHT).pack(anchor="w", padx=12, pady=(10, 6))
         input_names, output_names = self.get_audio_device_names()
         input_values = ["Default"] + input_names
         output_values = ["Default"] + output_names
-        input_var = ctk.StringVar(value=self.voice_device_input or "Default")
-        output_var = ctk.StringVar(value=self.voice_device_output or "Default")
-
+        input_current = self.voice_device_input if self.voice_device_input in input_values else "Default"
+        output_current = self.voice_device_output if self.voice_device_output in output_values else "Default"
+        input_var = ctk.StringVar(value=input_current)
+        output_var = ctk.StringVar(value=output_current)
         ctk.CTkLabel(voice_frame, text="Microphone", font=(FONT_MONO, 9), text_color=FG_DIM).pack(anchor="w", padx=12)
-        input_menu = ctk.CTkOptionMenu(voice_frame, variable=input_var, values=input_values, width=440,
-                                       fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER,
-                                       text_color=FG_BRIGHT, font=(FONT_MONO, 9))
-        input_menu.pack(padx=12, pady=(2, 7))
+        ctk.CTkOptionMenu(voice_frame, variable=input_var, values=input_values, width=480, fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9)).pack(padx=12, pady=(2, 7))
         ctk.CTkLabel(voice_frame, text="Output / speakers", font=(FONT_MONO, 9), text_color=FG_DIM).pack(anchor="w", padx=12)
-        output_menu = ctk.CTkOptionMenu(voice_frame, variable=output_var, values=output_values, width=440,
-                                        fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER,
-                                        text_color=FG_BRIGHT, font=(FONT_MONO, 9))
-        output_menu.pack(padx=12, pady=(2, 10))
+        ctk.CTkOptionMenu(voice_frame, variable=output_var, values=output_values, width=480, fg_color=BTN_BG, button_color=FG_DIM, button_hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 9)).pack(padx=12, pady=(2, 10))
+
+        status = ctk.CTkLabel(win, text="Changes are not permanent until SAVE SETTINGS is pressed.", font=(FONT_MONO, 9), text_color=FG_DIM)
+        status.pack(pady=(3, 5))
 
         def save_and_close():
-            self.dm_sound_mode = sound_var.get()
-            self.voice_device_input = None if input_var.get() == "Default" else input_var.get()
-            self.voice_device_output = None if output_var.get() == "Default" else output_var.get()
-            self._save_setting("DM_SOUND", self.dm_sound_mode)
-            self._save_setting("DM_SOUND_PATH", self.dm_sound_path)
-            self._save_setting("VOICE_INPUT_DEVICE", self.voice_device_input or "")
-            self._save_setting("VOICE_OUTPUT_DEVICE", self.voice_device_output or "")
-            win.destroy()
+            mode = sound_var.get()
+            inp = None if input_var.get() == "Default" else input_var.get()
+            out = None if output_var.get() == "Default" else output_var.get()
+            path = self.dm_sound_path if mode == "custom" else self.dm_sound_path
+            if self.save_settings_file(mode, path, inp, out):
+                status.configure(text="✓ SETTINGS SAVED", text_color=FG_BRIGHT)
+                win.after(350, win.destroy)
 
-        ctk.CTkButton(win, text="SAVE", command=save_and_close, width=150, height=34,
-                      corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER,
-                      text_color="black", font=(FONT_MONO, 11, "bold")).pack(pady=12)
+        def reset_defaults():
+            sound_var.set("ping")
+            input_var.set("Default")
+            output_var.set("Default")
+            self.dm_sound_path = ""
+            sound_path_label.configure(text="Built-in notification")
+            status.configure(text="Defaults selected — press SAVE SETTINGS", text_color=FG_DIM)
 
+        buttons = ctk.CTkFrame(win, fg_color="transparent")
+        buttons.pack(pady=8)
+        ctk.CTkButton(buttons, text="SAVE SETTINGS", command=save_and_close, width=170, height=38, corner_radius=0, fg_color=FG_DIM, hover_color=BTN_ACTIVE_HOVER, text_color="black", font=(FONT_MONO, 11, "bold")).pack(side="left", padx=6)
+        ctk.CTkButton(buttons, text="RESET DEFAULTS", command=reset_defaults, width=150, height=38, corner_radius=0, fg_color=BTN_BG, hover_color=BTN_HOVER, text_color=FG_BRIGHT, font=(FONT_MONO, 10, "bold")).pack(side="left", padx=6)
     def get_audio_device_names(self):
         if not SOUNDDEVICE_AVAILABLE:
             return [], []
