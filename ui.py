@@ -272,6 +272,7 @@ def load_settings() -> dict:
         "voice_volume": 1.25,
         "voice_mic_gain": 1.0,
         "voice_quality": "High",
+        "voice_profile": "Recording",
         "voice_noise_gate": True,
         "voice_agc": True,
         "voice_echo_guard": True,
@@ -528,6 +529,8 @@ class FullDiscordClone(QMainWindow):
         self.reply_target = None
         self.message_card_widgets = {}
         self.voice_activity = {}
+        self.voice_levels = {}
+        self.voice_wave_labels = {}
         self.loading_history = False
         self._chat_cache_dirty = False
         self._render_generation = 0
@@ -590,7 +593,7 @@ class FullDiscordClone(QMainWindow):
 
         self.voice_stats_timer = QTimer(self)
         self.voice_stats_timer.timeout.connect(self._update_voice_stats)
-        self.voice_stats_timer.start(500)
+        self.voice_stats_timer.start(100)
 
         self._connect_after_start = QTimer(self)
         self._connect_after_start.setSingleShot(True)
@@ -659,9 +662,9 @@ class FullDiscordClone(QMainWindow):
             color: {c['bright']};
             border: 1px solid {c['border']};
             border-radius: 0px;
-            padding: 5px 8px;
+            padding: 4px 6px;
             font-family: Consolas;
-            font-size: 11px;
+            font-size: 10px;
         }}
         QPushButton:hover, QToolButton:hover {{ background: {c['hover']}; }}
         QPushButton:pressed, QToolButton:pressed {{ background: {c['active']}; color: {c['root']}; }}
@@ -963,7 +966,7 @@ class FullDiscordClone(QMainWindow):
         self.settings_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         outer = QVBoxLayout(self.settings_panel)
-        outer.setContentsMargins(20, 16, 20, 14)
+        outer.setContentsMargins(14, 12, 14, 10)
         outer.setSpacing(8)
 
         title_row = QHBoxLayout()
@@ -991,7 +994,7 @@ class FullDiscordClone(QMainWindow):
         self.settings_scroll = scroll
 
         body = QWidget()
-        body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(0, 2, 0, 10)
         body_layout.setSpacing(10)
@@ -1120,7 +1123,7 @@ class FullDiscordClone(QMainWindow):
         profile_row.addWidget(QLabel("Voice profile"))
         self.voice_profile_combo = QComboBox()
         self.voice_profile_combo.addItems(["Casual", "Clear Voice", "Recording", "Low Bandwidth"])
-        self.voice_profile_combo.setCurrentText(self.settings.get("voice_profile", "Casual"))
+        self.voice_profile_combo.setCurrentText(self.settings.get("voice_profile", "Recording"))
         self.voice_profile_combo.currentTextChanged.connect(self._apply_voice_profile)
         profile_row.addWidget(self.voice_profile_combo)
         content_layout.addLayout(profile_row)
@@ -1158,8 +1161,9 @@ class FullDiscordClone(QMainWindow):
         ]
         for i, (label, fn) in enumerate(actions):
             b = QPushButton(label)
-            b.setMinimumHeight(34)
+            b.setFixedHeight(28)
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            b.setStyleSheet("padding: 2px 4px; font-size: 10px;")
             b.clicked.connect(fn)
             hub_grid.addWidget(b, i // 2, i % 2)
         hl.addLayout(hub_grid)
@@ -1180,13 +1184,13 @@ class FullDiscordClone(QMainWindow):
         self.settings_status.setProperty("role", "muted")
         footer_layout.addWidget(self.settings_status, 1)
         save_btn = QPushButton("SAVE SETTINGS")
-        save_btn.setFixedHeight(36)
-        save_btn.setMinimumWidth(150)
+        save_btn.setFixedHeight(32)
+        save_btn.setFixedWidth(118)
         save_btn.clicked.connect(self.save_settings_from_ui)
         footer_layout.addWidget(save_btn)
         close_btn = QPushButton("CLOSE")
-        close_btn.setFixedHeight(36)
-        close_btn.setMinimumWidth(100)
+        close_btn.setFixedHeight(32)
+        close_btn.setFixedWidth(78)
         close_btn.clicked.connect(self.close_settings)
         footer_layout.addWidget(close_btn)
         outer.addWidget(footer)
@@ -1446,7 +1450,8 @@ class FullDiscordClone(QMainWindow):
 
     def _apply_voice_profile(self, name):
         profiles = {
-            "Casual": {"voice_quality": "High", "voice_volume": 1.25, "voice_mic_gain": 1.0, "voice_noise_gate": True, "voice_agc": True},
+            "Casual": {"voice_quality": "High",
+        "voice_profile": "Recording", "voice_volume": 1.25, "voice_mic_gain": 1.0, "voice_noise_gate": True, "voice_agc": True},
             "Clear Voice": {"voice_quality": "Ultra", "voice_volume": 1.20, "voice_mic_gain": 1.10, "voice_noise_gate": True, "voice_agc": True},
             "Recording": {"voice_quality": "Ultra", "voice_volume": 1.00, "voice_mic_gain": 0.90, "voice_noise_gate": False, "voice_agc": False},
             "Low Bandwidth": {"voice_quality": "Low", "voice_volume": 1.25, "voice_mic_gain": 1.0, "voice_noise_gate": True, "voice_agc": True},
@@ -1474,7 +1479,7 @@ class FullDiscordClone(QMainWindow):
             "dm_sound_path": self.settings.get("dm_sound_path", ""),
             "voice_input_device": self._audio_selection_to_index(self.input_device_combo.currentText()),
             "voice_output_device": self._audio_selection_to_index(self.output_device_combo.currentText()),
-            "voice_profile": self.voice_profile_combo.currentText() if hasattr(self, "voice_profile_combo") else self.settings.get("voice_profile", "Casual"),
+            "voice_profile": self.voice_profile_combo.currentText() if hasattr(self, "voice_profile_combo") else self.settings.get("voice_profile", "Recording"),
             "voice_volume": self.voice_volume,
             "voice_mic_gain": self.voice_mic_gain,
             "voice_quality": self.voice_quality,
@@ -2313,7 +2318,7 @@ class FullDiscordClone(QMainWindow):
             os.replace(state["path"], target)
             self.chat_status_label.setText(f"download complete // {meta.get('name', 'file')}")
             self._open_local_file(target, meta)
-            self.reload_current_chat_view()
+            self.reload_current_chat_view(preserve_scroll=True)
         except Exception as exc:
             self.show_error(f"File download failed: {exc}")
 
@@ -2371,7 +2376,16 @@ class FullDiscordClone(QMainWindow):
             self._chat_cache_dirty = True
             self._save_chat_cache()
             if room == self.current_target:
-                self.reload_current_chat_view()
+                message_id = payload.get("message_id")
+                card = self.message_card_widgets.get(message_id)
+                poll_data = next((m.get("poll") for m in self.chat_history.get(room, []) if m.get("id") == message_id), None)
+                if card is not None and poll_data is not None and hasattr(card, "poll_count_labels"):
+                    votes = poll_data.get("votes") or {}
+                    for idx, label in enumerate(card.poll_count_labels):
+                        label.setText(str(len(votes.get(str(idx), []))))
+                else:
+                    # Only rebuild if the poll card is not currently rendered.
+                    self.reload_current_chat_view(preserve_scroll=True)
         except Exception:
             pass
 
@@ -2543,15 +2557,13 @@ class FullDiscordClone(QMainWindow):
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(4, 3, 4, 3)
-        layout.setSpacing(7)
-
+        layout.setSpacing(6)
         avatar = QLabel()
         avatar.setFixedSize(30, 30)
         avatar.setAlignment(Qt.AlignCenter)
         avatar_img = self.user_pfps.get(user, Image.new("RGB", (40, 40), "#0F3D0F"))
         avatar.setPixmap(self.pil_to_pixmap(avatar_img, (30, 30)))
         layout.addWidget(avatar)
-
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(0)
@@ -2563,12 +2575,22 @@ class FullDiscordClone(QMainWindow):
             status_label.setProperty("role", "muted")
             status_label.setWordWrap(True)
             text_col.addWidget(status_label)
+        elif voice:
+            voice_label = QLabel("VOICE")
+            voice_label.setProperty("role", "muted")
+            text_col.addWidget(voice_label)
         else:
             online_label = QLabel("ONLINE" if online else "OFFLINE")
             online_label.setProperty("role", "muted")
             text_col.addWidget(online_label)
         layout.addLayout(text_col, 1)
-
+        if voice:
+            wave = QLabel("[.....]")
+            wave.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            wave.setFixedWidth(58)
+            wave.setStyleSheet(f"color:{self.palette_colors()['dim']}; font-family:Consolas; font-size:11px; font-weight:700;")
+            layout.addWidget(wave)
+            self.voice_wave_labels[user] = wave
         dot = QLabel("●")
         dot.setStyleSheet(f"color:{self.palette_colors()['bright'] if online else self.palette_colors()['faint']};")
         layout.addWidget(dot, alignment=Qt.AlignRight | Qt.AlignVCenter)
@@ -2591,12 +2613,59 @@ class FullDiscordClone(QMainWindow):
 
     def _refresh_voice_users(self):
         self.voice_user_list.clear()
+        self.voice_wave_labels = {}
         for user in self.voice_users:
             widget = self._make_member_widget(user, online=True, voice=True)
             self._add_widget_item(self.voice_user_list, widget, 44)
         self._refresh_voice_user_settings()
 
-    def reload_current_chat_view(self):
+    def _capture_chat_scroll_anchor(self):
+        if not hasattr(self, "chat_scroll"):
+            return None
+        bar = self.chat_scroll.verticalScrollBar()
+        value = bar.value()
+        maximum = bar.maximum()
+        page = max(1, bar.pageStep())
+        at_bottom = maximum - value <= max(12, page // 3)
+        ratio = (value / maximum) if maximum > 0 else 0.0
+        return {
+            "value": value,
+            "maximum": maximum,
+            "ratio": ratio,
+            "at_bottom": at_bottom,
+        }
+
+    def _restore_chat_scroll_anchor(self, anchor):
+        if not anchor or not hasattr(self, "chat_scroll"):
+            return
+        def restore():
+            self.chat_content_layout.activate()
+            self.chat_content.adjustSize()
+            bar = self.chat_scroll.verticalScrollBar()
+            maximum = bar.maximum()
+            if anchor.get("at_bottom"):
+                target = maximum
+            elif maximum <= 0:
+                target = 0
+            elif anchor.get("maximum", 0) > 0:
+                # Preserve the same relative position rather than restoring an
+                # obsolete absolute pixel value after a card's height changes.
+                target = int(round(maximum * float(anchor.get("ratio", 0.0))))
+            else:
+                target = min(int(anchor.get("value", 0)), maximum)
+            bar.setValue(max(0, min(target, maximum)))
+        QTimer.singleShot(0, restore)
+        QTimer.singleShot(20, restore)
+        QTimer.singleShot(60, restore)
+
+    def reload_current_chat_view(self, preserve_scroll=False):
+        # Capture the user's position before rebuilding. Poll votes and file
+        # completion used to rebuild the entire chat and reset QScrollArea to
+        # the top, which made the view jump unexpectedly.
+        anchor = self._capture_chat_scroll_anchor() if preserve_scroll else None
+        self._pending_chat_scroll_anchor = anchor
+        self._chat_wants_bottom = False
+
         # Cancel any older incremental render. Rebuilding 500 Qt widgets in one
         # callback makes the window feel frozen, especially immediately after login.
         self._render_generation += 1
@@ -2614,6 +2683,8 @@ class FullDiscordClone(QMainWindow):
             empty = QLabel("No messages yet.")
             empty.setProperty("role", "muted")
             self.chat_content_layout.addWidget(empty)
+            if anchor:
+                self._restore_chat_scroll_anchor(anchor)
             return
 
         self._render_messages = messages
@@ -2684,12 +2755,14 @@ class FullDiscordClone(QMainWindow):
             question.setWordWrap(True)
             body.addWidget(question)
             votes = poll.setdefault("votes", {})
+            card.poll_count_labels = []
             for idx, option in enumerate(poll.get("options", [])):
                 row = QHBoxLayout()
                 vote_btn = QPushButton(str(option))
                 vote_btn.clicked.connect(lambda _=False, m=msg, i=idx: self._vote_poll(m, i))
                 count = QLabel(str(len(votes.get(str(idx), []))))
                 count.setProperty("role", "muted")
+                card.poll_count_labels.append(count)
                 row.addWidget(vote_btn, 1)
                 row.addWidget(count)
                 body.addLayout(row)
@@ -2749,9 +2822,14 @@ class FullDiscordClone(QMainWindow):
         messages = getattr(self, "_render_messages", [])
         start = getattr(self, "_render_index", 0)
         if start >= len(messages):
-            self._chat_wants_bottom = True
-            self._scroll_chat_to_bottom()
-            QTimer.singleShot(20, self._scroll_chat_to_bottom)
+            anchor = getattr(self, "_pending_chat_scroll_anchor", None)
+            self._pending_chat_scroll_anchor = None
+            if anchor:
+                self._restore_chat_scroll_anchor(anchor)
+            else:
+                self._chat_wants_bottom = True
+                self._scroll_chat_to_bottom()
+                QTimer.singleShot(20, self._scroll_chat_to_bottom)
             return
 
         end = min(start + batch_size, len(messages))
@@ -2937,6 +3015,18 @@ class FullDiscordClone(QMainWindow):
                 if self.voice_muted or (self.voice_ptt and not self.voice_ptt_down):
                     pcm = b"\x00" * len(pcm)
                 pcm = self._process_mic_pcm(pcm)
+                try:
+                    samples = array.array("h")
+                    samples.frombytes(pcm[:len(pcm) - (len(pcm) % 2)])
+                    if samples:
+                        mean_sq = sum(int(v) * int(v) for v in samples) / len(samples)
+                        level = min(1.0, math.sqrt(mean_sq) / 32768.0 * 30.0)
+                    else:
+                        level = 0.0
+                    self.voice_levels[self.username] = math.sqrt(mean_sq) / 32768.0 * 30.0 if samples else 0.0
+                    self.voice_activity[self.username] = time.monotonic() if level > 0.025 else self.voice_activity.get(self.username, 0.0)
+                except Exception:
+                    self.voice_levels[self.username] = 0.0
                 network_rate = self._voice_rate()
                 if (
                     self.voice_send_resampler is None
@@ -3000,6 +3090,17 @@ class FullDiscordClone(QMainWindow):
         gain = self.voice_volume * float(self.voice_user_volumes.get(sender, 1.0))
         playback = self._apply_voice_gain(playback, gain)
         self.voice_output_stream.write(playback)
+        try:
+            samples = array.array("h")
+            samples.frombytes(playback[:len(playback) - (len(playback) % 2)])
+            if samples:
+                mean_sq = sum(int(v) * int(v) for v in samples) / len(samples)
+                rms = math.sqrt(mean_sq) / 32768.0 * 30.0
+            else:
+                rms = 0.0
+        except Exception:
+            rms = 0.0
+        self.voice_levels[sender] = rms
         self.voice_activity[sender] = time.monotonic()
         if self.voice_record_wave:
             self.voice_record_wave.writeframes(playback)
@@ -3023,6 +3124,8 @@ class FullDiscordClone(QMainWindow):
         self.voice_input_stream = None
         self.voice_output_stream = None
         self.voice_resamplers.clear()
+        self.voice_levels.clear()
+        self.voice_wave_labels = {}
         self.voice_send_resampler = None
         self.voice_button.setText("JOIN VOICE")
         self.chat_status_label.setText("connected" if self.authenticated else "offline")
@@ -3041,19 +3144,22 @@ class FullDiscordClone(QMainWindow):
             now = time.monotonic()
             active = []
             for user in self.voice_users:
-                if user == self.username:
-                    label = "YOU"
-                    active.append(label)
-                else:
-                    age = now - float(self.voice_activity.get(user, 0.0))
-                    label = user
-                    if age < 0.65:
-                        label = f"> {user} <"
-                        active.append(label)
+                age = now - float(self.voice_activity.get(user, 0.0))
+                level = float(self.voice_levels.get(user, 0.0))
+                if age > 0.25:
+                    level *= max(0.0, 1.0 - (age - 0.25) / 0.9)
+                filled = max(0, min(5, int(level * 5.0 + 0.5)))
+                wave = "[" + ("|" * filled) + ("." * (5 - filled)) + "]"
+                label = self.voice_wave_labels.get(user)
+                if label:
+                    label.setText(wave)
+                    label.setStyleSheet(f"color:{self.palette_colors()['bright'] if level > 0.025 else self.palette_colors()['dim']}; font-family:Consolas; font-size:10px; font-weight:700;")
+                if level > 0.025 and age < 1.2:
+                    active.append(user if user != self.username else "YOU")
             if active:
                 self.voice_radar_label.setText("VOICE RADAR\n" + "  ".join(active))
             elif self.voice_users:
-                self.voice_radar_label.setText("VOICE RADAR\nno active speakers")
+                self.voice_radar_label.setText("VOICE RADAR\nlistening…")
             else:
                 self.voice_radar_label.setText("VOICE RADAR\nno one connected")
 
