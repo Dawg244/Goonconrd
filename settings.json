@@ -1,11 +1,13 @@
 {
-  "theme": "NETRA Terminal",
-  "dm_sound_mode": "ping_5",
+  "theme": "Sakura",
+  "server_host": "108.221.36.120",
+  "server_port": 12145,
+  "dm_sound_mode": "ping_4",
   "dm_sound_path": "C:/Users/Leo/Downloads/oxp.wav",
   "voice_input_device": 1,
   "voice_output_device": 7,
   "voice_volume": 1.0,
-  "voice_mic_gain": 1.2,
+  "voice_mic_gain": 0.9,
   "voice_quality": "Ultra",
   "voice_profile": "Recording",
   "voice_noise_gate": false,
@@ -15,5 +17,59 @@
   "voice_ptt": false,
   "voice_record": false,
   "voice_user_volumes": {},
-  "voice_user_mutes": {}
+  "voice_user_mutes": {},
+  "notification_settings": {
+    "general-chat": true
+  },
+  "notification_history": [],
+  "rich_presence": {
+    "enabled": true,
+    "activity": "Making netra",
+    "details": "Online",
+    "state": "",
+    "show_server": true
+  },
+  "customization": {
+    "accent": "",
+    "font_size": 17,
+    "density": "Compact"
+  },
+  "music_playlists": {
+    "Favorites": [
+      "https://music.youtube.com/playlist?list=PLN_Bo8VyU1dQ3bYTyLfNB5C7cPK1ym5Op"
+    ]
+  },
+  "active_playlist": "Favorites",
+  "client_plugins": {},
+  "server_plugins": {},
+  "developer_mode": true,
+  "offline_mode": false,
+  "screen_share_quality": "High",
+  "remember_username": true,
+  "auto_open_images": true,
+  "desktop_notifications": false,
+  "notification_sound_enabled": true,
+  "ui_scale": 125,
+  "ptt_key": "Control",
+  "release_channel": "Stable",
+  "debug_log": [
+    "2026-09-26 17:34:48  NETRA started",
+    "2026-09-26 17:39:32  NETRA started",
+    "2026-09-26 17:43:26  NETRA started",
+    "2026-09-26 17:47:28  NETRA started",
+    "2026-09-26 17:50:28  NETRA started",
+    "2026-09-26 17:52:44  NETRA started",
+    "2026-09-26 17:57:15  NETRA started",
+    "2026-09-26 17:57:28  NETRA started",
+    "2026-09-26 18:01:09  NETRA started",
+    "2026-09-26 18:09:28  NETRA started"
+  ],
+  "screen_share_source": "Monitor 1 \u2014 VG272U W2 \u2014 2048\u00d71152 \u2022 PRIMARY",
+  "screen_share_fps": 30,
+  "screen_share_cursor": true,
+  "drafts": {},
+  "recent_targets": [
+    "general-chat"
+  ],
+  "dnd_mode": false
 }

@@ -6,11 +6,22 @@ import hashlib
 import secrets
 import uuid
 import re
+import struct
+import queue
+import base64
+import time
+
+PROTOCOL_VERSION = 2
+SERVER_CAPABILITIES = {"VOICE", "SCREENSHARE", "MESSAGE_IDS", "MESSAGE_ACK", "TYPING", "PRESENCE", "HEARTBEAT", "RATE_LIMIT"}
+HEARTBEAT_SECONDS = 25
+RATE_LIMIT_WINDOW = 2.0
+RATE_LIMIT_MAX = 40
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HOST = "0.0.0.0"
 PORT = int(os.getenv("NETRA_SERVER_PORT", "12155"))
 VOICE_PORT = int(os.getenv("NETRA_VOICE_PORT", "12156"))
+SCREEN_PORT = int(os.getenv("NETRA_SCREEN_PORT", "12157"))
 MAIN_HOST = os.getenv("NETRA_MAIN_HOST", "108.221.36.120")
 MAIN_PORT = int(os.getenv("NETRA_MAIN_PORT", "12145"))
 SERVER_ID = os.getenv("NETRA_SERVER_ID", uuid.uuid4().hex)
@@ -27,6 +38,12 @@ clients_pfp = {}     # username -> base64 png string (last known pfp)
 server_icon_b64 = None  # base64 png string for the shared "server" icon, or None
 clients_lock = threading.Lock()
 
+# Live session metadata / protocol state.
+session_meta = {}       # connection -> {username, version, capabilities, last_pong, rate_times}
+session_lock = threading.Lock()
+presence_state = {}     # username -> {status, custom}
+presence_state_lock = threading.Lock()
+
 # "Who's in voice" for display purposes - driven over TCP so it doesn't
 # depend on UDP port forwarding being set up correctly.
 voice_presence_users = set()
@@ -35,6 +52,13 @@ presence_lock = threading.Lock()
 # Actual audio relay bookkeeping (UDP) - separate from the display list above.
 voice_clients = {}   # addr -> username
 voice_lock = threading.Lock()
+
+# Dedicated screen-share relay. Each authenticated screen connection is
+# independent from the chat TCP socket and voice UDP socket.
+screen_tokens = {}          # username -> opaque token
+screen_peers = {}           # socket -> {username, send_queue, alive}
+screen_sharers = {}        # username -> metadata for active shares
+screen_lock = threading.Lock()
 
 log_lock = threading.Lock()
 save_timer = None
@@ -248,10 +272,218 @@ def authenticate_via_main(action, raw_username, encoded_password):
         return True,p[1],p[2],''
     return False,'','',r.split(':',1)[1] if ':' in r else r
 
+# ---------------- Protocol / session helpers ----------------
+
+def _session_set(connection, **updates):
+    with session_lock:
+        meta = session_meta.setdefault(connection, {"username": "", "version": 1, "capabilities": set(), "last_pong": time.monotonic(), "rate_times": []})
+        meta.update(updates)
+        return dict(meta)
+
+def _session_remove(connection):
+    with session_lock:
+        session_meta.pop(connection, None)
+
+def _rate_allowed(connection, cost=1):
+    now = time.monotonic()
+    with session_lock:
+        meta = session_meta.setdefault(connection, {"username": "", "version": 1, "capabilities": set(), "last_pong": now, "rate_times": []})
+        times = meta.setdefault("rate_times", [])
+        cutoff = now - RATE_LIMIT_WINDOW
+        while times and times[0] < cutoff:
+            times.pop(0)
+        if len(times) + cost > RATE_LIMIT_MAX:
+            return False
+        times.extend([now] * max(1, cost))
+        return True
+
+def _send_protocol_hello(connection):
+    caps = ",".join(sorted(SERVER_CAPABILITIES))
+    connection.sendall(f"PROTOCOL:{PROTOCOL_VERSION}:{caps}\n".encode("utf-8"))
+
+def _broadcast_presence_snapshot():
+    with presence_state_lock:
+        items = [f"{u}\x1f{v.get('status','online')}\x1f{v.get('custom','')}" for u, v in sorted(presence_state.items(), key=lambda x: x[0].casefold())]
+    broadcast("PRESENCE_SNAPSHOT:" + "\x1e".join(items) + "\n")
+
+def _set_presence(username, status="online", custom=""):
+    with presence_state_lock:
+        presence_state[username] = {"status": status or "online", "custom": custom or ""}
+    broadcast(f"PRESENCE:{username}:{status or 'online'}:{custom or ''}\n")
+
+def _remove_presence(username):
+    with presence_state_lock:
+        presence_state.pop(username, None)
+    broadcast(f"PRESENCE:{username}:offline:\n")
+
+def _heartbeat_loop():
+    while True:
+        time.sleep(HEARTBEAT_SECONDS)
+        now = time.monotonic()
+        stale = []
+        with session_lock:
+            items = list(session_meta.items())
+        for conn, meta in items:
+            if not meta.get("username"):
+                continue
+            if now - float(meta.get("last_pong", now)) > HEARTBEAT_SECONDS * 2.5:
+                stale.append(conn)
+                continue
+            try:
+                conn.sendall(f"PING:{int(now)}\n".encode("utf-8"))
+            except Exception:
+                stale.append(conn)
+        for conn in stale:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 # ---------------- Text / chat TCP server ----------------
+
+def _new_screen_token(username):
+    token = secrets.token_urlsafe(32)
+    with screen_lock:
+        screen_tokens[username] = token
+    return token
+
+def _invalidate_screen_token(username):
+    with screen_lock:
+        screen_tokens.pop(username, None)
+
+def _screen_token_valid(username, token):
+    with screen_lock:
+        return secrets.compare_digest(str(screen_tokens.get(username, "")), str(token))
+
+def _screen_peer_sender(peer_sock, peer):
+    while peer.get("alive"):
+        try:
+            packet = peer["queue"].get()
+            if packet is None:
+                break
+            peer_sock.sendall(packet)
+        except Exception:
+            break
+    with screen_lock:
+        screen_peers.pop(peer_sock, None)
+    try:
+        peer_sock.close()
+    except Exception:
+        pass
+
+def _screen_enqueue(peer_sock, packet):
+    with screen_lock:
+        peer = screen_peers.get(peer_sock)
+        if not peer or not peer.get("alive"):
+            return
+        q = peer["queue"]
+        # Newest-frame-only: drop the stale frame rather than building latency.
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except Exception:
+                break
+        try:
+            q.put_nowait(packet)
+        except Exception:
+            pass
+
+def _screen_broadcast(sender_sock, sender, frame_payload):
+    # Frame format v2: F + uint64 sequence + uint16 username length + username +
+    # uint16 fps + uint16 width + uint16 height + JPEG. Older F+seq+JPEG frames
+    # are still relayed unchanged.
+    packet = struct.pack("!I", len(frame_payload)) + frame_payload
+    with screen_lock:
+        targets = [(sock, peer) for sock, peer in screen_peers.items()
+                   if sock is not sender_sock and peer.get("username") != sender and peer.get("alive")]
+    for sock, _peer in targets:
+        _screen_enqueue(sock, packet)
+
+def screen_client(connection, address):
+    username = None
+    try:
+        connection.settimeout(10)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = connection.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > 8192:
+                return
+        line, buf = buf.split(b"\n", 1)
+        parts = line.decode("utf-8", errors="ignore").split(":", 2)
+        if len(parts) != 3 or parts[0] != "HELLO" or not _screen_token_valid(parts[1], parts[2]):
+            connection.sendall(b"SCREEN_AUTH_FAIL\n")
+            return
+        username = parts[1]
+        connection.settimeout(None)
+        peer = {"username": username, "queue": queue.Queue(maxsize=1), "alive": True}
+        with screen_lock:
+            old = [sock for sock, p in screen_peers.items() if p.get("username") == username]
+            for sock in old:
+                old_peer = screen_peers.pop(sock, None)
+                if old_peer:
+                    old_peer["alive"] = False
+                    try: old_peer["queue"].put_nowait(None)
+                    except Exception: pass
+                    try: sock.close()
+                    except Exception: pass
+            screen_peers[connection] = peer
+        threading.Thread(target=_screen_peer_sender, args=(connection, peer), daemon=True).start()
+        connection.sendall(b"SCREEN_OK\n")
+
+        while True:
+            header = b""
+            while len(header) < 4:
+                chunk = connection.recv(4 - len(header))
+                if not chunk:
+                    return
+                header += chunk
+            length = struct.unpack("!I", header)[0]
+            if length < 9 or length > 8_000_000:
+                return
+            payload = b""
+            while len(payload) < length:
+                chunk = connection.recv(min(65536, length - len(payload)))
+                if not chunk:
+                    return
+                payload += chunk
+            # F + sequence(uint64) + JPEG bytes
+            if payload[:1] != b"F" or len(payload) < 9:
+                continue
+            _screen_broadcast(connection, username, payload)
+    except Exception as exc:
+        print(f"[SCREEN] {username or address} disconnected: {exc}")
+    finally:
+        with screen_lock:
+            peer = screen_peers.pop(connection, None)
+            if peer:
+                peer["alive"] = False
+                try: peer["queue"].put_nowait(None)
+                except Exception: pass
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+def screen_relay():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as screen_server:
+        screen_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        screen_server.bind((HOST, SCREEN_PORT))
+        screen_server.listen(64)
+        print(f"[*] Screen relay listening on {HOST}:{SCREEN_PORT}")
+        while True:
+            conn, addr = screen_server.accept()
+            threading.Thread(target=screen_client, args=(conn, addr), daemon=True).start()
 
 def handle_client(connection, address):
     username = None
+    _session_set(connection, last_pong=time.monotonic(), address=address)
     buffer = ""  # accumulates partial data between recv() calls
     try:
         while True:
@@ -259,7 +491,7 @@ def handle_client(connection, address):
             if not data:
                 break
 
-            buffer += data.decode('utf-8')
+            buffer += data.decode('utf-8', errors='replace')
 
             # A recv() can contain 0, 1, or several complete lines.
             # Process every complete line (ending in \n) and keep any
@@ -299,6 +531,13 @@ def handle_client(connection, address):
                 stale_addrs = [a for a, u in voice_clients.items() if u == username]
                 for a in stale_addrs:
                     del voice_clients[a]
+            if was_current_connection:
+                _invalidate_screen_token(username)
+                _remove_presence(username)
+                with screen_lock:
+                    screen_sharers.pop(username, None)
+                broadcast(f"SCREENSHARE:STOPPED:{username}\n")
+        _session_remove(connection)
         connection.close()
 
 
@@ -315,6 +554,7 @@ def process_line(message, username, connection, address):
         if not ok:
             connection.sendall(f"AUTH_FAIL:{reason}\n".encode('utf-8')); return username
         username=central_name
+        _session_set(connection, username=username, version=1, capabilities=set(), last_pong=time.monotonic())
         with accounts_lock:
             accounts.setdefault(aid,{"username":username,"username_normalized":normalize_username(username)})
             username_to_account[normalize_username(username)]=aid
@@ -337,6 +577,19 @@ def process_line(message, username, connection, address):
             channel_histories={ch:list(message_log.get(ch,[])) for ch in TEXT_CHANNELS}
             dm_hist_items=[(k,list(v)) for k,v in message_log['dms'].items() if username in k.split('|')]
         connection.sendall(f"AUTH_OK:{aid}:{username}\n".encode())
+        _send_protocol_hello(connection)
+        with presence_state_lock:
+            presence_snapshot = dict(presence_state)
+        if username not in presence_snapshot:
+            presence_snapshot[username] = {"status": "online", "custom": ""}
+        snap = "\x1e".join(f"{u}\x1f{v.get('status','online')}\x1f{v.get('custom','')}" for u, v in sorted(presence_snapshot.items(), key=lambda x: x[0].casefold()))
+        connection.sendall(("PRESENCE_SNAPSHOT:" + snap + "\n").encode("utf-8"))
+        with screen_lock:
+            share_snap = "\x1e".join(f"{u}\x1f{v.get('fps',30)}\x1f{v.get('quality','68')}" for u, v in sorted(screen_sharers.items(), key=lambda x: x[0].casefold()))
+        connection.sendall(("SCREENSHARE_SNAPSHOT:" + share_snap + "\n").encode("utf-8"))
+        _set_presence(username, "online", "")
+        screen_token = _new_screen_token(username)
+        connection.sendall(f"SCREEN_TOKEN:{screen_token}:{SCREEN_PORT}\n".encode())
         for channel,entries in channel_histories.items():
             for entry in entries:
                 connection.sendall(f"HIST_CHANNEL:{channel}:{entry.get('sender','')}:{entry.get('text','')}\n".encode())
@@ -389,9 +642,108 @@ def process_line(message, username, connection, address):
         with voice_lock:
             for addr,who in list(voice_clients.items()):
                 if who==old_name: voice_clients[addr]=new_name
-        connection.sendall(f"RENAME_OK:{old_name}:{new_name}\n".encode()); broadcast(f"USER_RENAMED:{old_name}:{new_name}\n"); broadcast_user_list(); return new_name
+        _session_set(connection, username=new_name)
+        with presence_state_lock:
+            old_presence = presence_state.pop(old_name, {"status": "online", "custom": ""})
+            presence_state[new_name] = old_presence
+        connection.sendall(f"RENAME_OK:{old_name}:{new_name}\n".encode())
+        _invalidate_screen_token(old_name)
+        new_screen_token = _new_screen_token(new_name)
+        connection.sendall(f"SCREEN_TOKEN:{new_screen_token}:{SCREEN_PORT}\n".encode())
+        broadcast(f"USER_RENAMED:{old_name}:{new_name}\n")
+        broadcast_user_list()
+        return new_name
 
     if not username:
+        return username
+
+    if not _rate_allowed(connection):
+        try:
+            connection.sendall(b"RATE_LIMITED:Too many requests; slow down\n")
+        except Exception:
+            pass
+        return username
+
+    if message == "PONG" or message.startswith("PONG:"):
+        _session_set(connection, last_pong=time.monotonic())
+        return username
+
+    if message.startswith("HELLO:"):
+        p = message.split(":", 2)
+        if len(p) >= 2:
+            try:
+                version = int(p[1])
+            except ValueError:
+                version = 1
+            caps = set(p[2].split(",")) if len(p) == 3 and p[2] else set()
+            _session_set(connection, version=version, capabilities=caps, last_pong=time.monotonic())
+            connection.sendall(f"PROTOCOL_OK:{PROTOCOL_VERSION}:{','.join(sorted(SERVER_CAPABILITIES))}\n".encode())
+        return username
+
+    if message.startswith("MESSAGE:"):
+        try:
+            payload = json.loads(base64.b64decode(message.split(":", 1)[1]).decode("utf-8"))
+            room = str(payload.get("room", "general-chat"))
+            text = str(payload.get("text", ""))
+            client_id = str(payload.get("id", ""))[:128]
+            reply_to = payload.get("reply_to")
+            if room not in TEXT_CHANNELS and room not in message_log.get("dms", {}):
+                # DM rooms are validated below; normal channels must exist.
+                if room not in TEXT_CHANNELS and not room:
+                    return username
+            msg_id = uuid.uuid4().hex
+            if room in TEXT_CHANNELS:
+                entry = {"id": msg_id, "client_id": client_id, "sender": username, "text": text, "reply_to": reply_to}
+                with log_lock:
+                    message_log.setdefault(room, []).append(entry)
+                    message_log[room] = message_log[room][-MAX_HISTORY_PER_CHANNEL:]
+                    schedule_log_save()
+                out = {"room": room, "id": msg_id, "client_id": client_id, "sender": username, "text": text, "reply_to": reply_to}
+                broadcast("MESSAGE:" + base64.b64encode(json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode()).decode() + "\n")
+                connection.sendall(f"MESSAGE_ACK:{client_id}:{msg_id}\n".encode("utf-8"))
+            else:
+                target = room
+                with accounts_lock:
+                    if not account_for_username(target):
+                        connection.sendall(b"ERROR:That user does not exist\n")
+                        return username
+                entry = {"id": msg_id, "client_id": client_id, "sender": username, "text": text, "reply_to": reply_to}
+                key = dm_key(username, target)
+                with log_lock:
+                    message_log["dms"].setdefault(key, []).append(entry)
+                    message_log["dms"][key] = message_log["dms"][key][-MAX_HISTORY_PER_CHANNEL:]
+                    schedule_log_save()
+                out = {"room": room, "id": msg_id, "client_id": client_id, "sender": username, "text": text, "reply_to": reply_to}
+                packet = "MESSAGE:" + base64.b64encode(json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode()).decode() + "\n"
+                with clients_lock:
+                    target_conn = clients.get(target)
+                for conn in [connection, target_conn]:
+                    if conn:
+                        try: conn.sendall(packet.encode("utf-8"))
+                        except Exception: pass
+                connection.sendall(f"MESSAGE_ACK:{client_id}:{msg_id}\n".encode("utf-8"))
+        except Exception as exc:
+            try: connection.sendall(f"ERROR:Invalid MESSAGE payload: {exc}\n".encode("utf-8"))
+            except Exception: pass
+        return username
+
+    if message == "SCREENSHARE:START" or message.startswith("SCREENSHARE:START:"):
+        fps = 30
+        quality = "68"
+        if message.count(":") >= 2:
+            extra = message.split(":", 2)[2]
+            if extra:
+                try: fps = max(1, min(120, int(extra)))
+                except ValueError: pass
+        with screen_lock:
+            screen_sharers[username] = {"fps": fps, "quality": quality}
+        broadcast(f"SCREENSHARE:STARTED:{username}:{fps}:{quality}\n")
+        return username
+
+    if message == "SCREENSHARE:STOP":
+        with screen_lock:
+            screen_sharers.pop(username, None)
+        broadcast(f"SCREENSHARE:STOPPED:{username}\n")
         return username
 
     if message.startswith("CHANNEL:"):
@@ -450,11 +802,10 @@ def process_line(message, username, connection, address):
     elif message.startswith("STATUS:"):
         payload=message.split(':',1)[1]
         bits=payload.split(':',1); status=bits[0]; custom=bits[1] if len(bits)>1 else ''
-        with clients_lock: 
-            targets=list(clients.values())
         # Persist centrally when possible.
         with accounts_lock: aid=account_for_username(username)
         if aid: main_request(f"SETSTATUS:{aid}:{status}:{custom}")
+        _set_presence(username, status, custom)
         broadcast(f"STATUS:{username}:{status}:{custom}\n")
 
     elif message.startswith("TYPING:"):
@@ -602,6 +953,8 @@ def voice_relay():
 
 def start_server():
     threading.Thread(target=voice_relay, daemon=True).start()
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    threading.Thread(target=screen_relay, daemon=True).start()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

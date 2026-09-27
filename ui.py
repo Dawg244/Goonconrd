@@ -1,4 +1,6 @@
 import array
+import ctypes
+from ctypes import wintypes
 import base64
 import io
 import json
@@ -7,6 +9,7 @@ import hashlib
 import mimetypes
 import os
 import queue
+import shutil
 import socket
 import struct
 import sys
@@ -19,7 +22,31 @@ from dataclasses import dataclass
 from typing import Optional
 
 from dotenv import load_dotenv, set_key
-from PIL import Image
+from PIL import Image, ImageGrab
+
+try:
+    import dxcam
+    DXCAM_AVAILABLE = True
+except ImportError:
+    dxcam = None
+    DXCAM_AVAILABLE = False
+
+# DXCam's normal desktop-color processor requires OpenCV. Keep OpenCV optional
+# so NETRA can automatically fall back to MSS instead of crashing its capture
+# thread when cv2 is not installed.
+try:
+    import cv2  # noqa: F401
+    CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    CV2_AVAILABLE = False
+
+try:
+    import mss
+    MSS_AVAILABLE = True
+except ImportError:
+    mss = None
+    MSS_AVAILABLE = False
 
 try:
     import sounddevice as sd
@@ -29,8 +56,22 @@ except ImportError:
     SOUNDDEVICE_AVAILABLE = False
 
 try:
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except ImportError:
+    yt_dlp = None
+    YTDLP_AVAILABLE = False
+
+try:
+    import av
+    AV_AVAILABLE = True
+except ImportError:
+    av = None
+    AV_AVAILABLE = False
+
+try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, QSize
-    from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QCursor
+    from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QCursor, QImage
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -51,6 +92,7 @@ try:
         QPushButton,
         QScrollArea,
         QSizePolicy,
+        QSystemTrayIcon,
         QSlider,
         QSplitter,
         QStackedWidget,
@@ -265,6 +307,8 @@ def save_settings(data: dict) -> None:
 def load_settings() -> dict:
     defaults = {
         "theme": "NETRA Terminal",
+        "server_host": "108.221.36.120",
+        "server_port": 12145,
         "dm_sound_mode": "ping",
         "dm_sound_path": "",
         "voice_input_device": None,
@@ -281,6 +325,24 @@ def load_settings() -> dict:
         "voice_record": False,
         "voice_user_volumes": {},
         "voice_user_mutes": {},
+        "notification_settings": {},
+        "notification_history": [],
+        "rich_presence": {"enabled": True, "activity": "Using NETRA", "details": "Online", "state": "", "show_server": True},
+        "customization": {"accent": "", "font_size": 12, "density": "Comfortable"},
+        "music_playlists": {},
+        "active_playlist": "Favorites",
+        "client_plugins": {},
+        "server_plugins": {},
+        "developer_mode": False,
+        "offline_mode": False,
+        "screen_share_quality": "Balanced",
+        "remember_username": True,
+        "auto_open_images": True,
+        "desktop_notifications": False,
+        "notification_sound_enabled": True,
+        "ui_scale": 100,
+        "ptt_key": "Control",
+        "release_channel": "Stable",
     }
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as handle:
@@ -390,7 +452,7 @@ class AuthDialog(QDialog):
     def __init__(self, parent, saved_username=""):
         super().__init__(parent)
         self.setWindowTitle("NETRA // ACCOUNT")
-        self.setFixedSize(430, 440)
+        self.setFixedSize(430, 520)
         self.setModal(True)
         self.setStyleSheet(parent.dialog_qss())
 
@@ -407,8 +469,23 @@ class AuthDialog(QDialog):
         subtitle.setProperty("role", "muted")
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
-        layout.addSpacing(10)
+        layout.addSpacing(6)
 
+        layout.addWidget(QLabel("SERVER ADDRESS"))
+        self.server_host = QLineEdit(str(parent.server_host))
+        self.server_host.setPlaceholderText("IP address or hostname")
+        layout.addWidget(self.server_host)
+
+        layout.addWidget(QLabel("SERVER PORT"))
+        self.server_port = QLineEdit(str(parent.server_port))
+        self.server_port.setPlaceholderText("12145")
+        layout.addWidget(self.server_port)
+
+        reset_ip = QPushButton("RESET SERVER IP")
+        reset_ip.clicked.connect(self.reset_server_address)
+        layout.addWidget(reset_ip)
+
+        layout.addSpacing(4)
         layout.addWidget(QLabel("USERNAME"))
         self.username = QLineEdit(saved_username if saved_username and saved_username != "User" else "")
         self.username.setPlaceholderText("username")
@@ -439,8 +516,8 @@ class AuthDialog(QDialog):
         layout.addWidget(offline)
 
         footer = QLabel(
-            "Your account is stored on the NETRA main server.\n"
-            f"Server: {DEFAULT_HOST}:{PORT}"
+            "Use the server address above to connect.\n"
+            "On the same LAN, use the server PC's local IPv4 address."
         )
         footer.setAlignment(Qt.AlignCenter)
         footer.setProperty("role", "muted")
@@ -450,9 +527,42 @@ class AuthDialog(QDialog):
         self.username.returnPressed.connect(self.password.setFocus)
         self.username.setFocus()
 
+    def reset_server_address(self):
+        """Restore the default NETRA server address and port."""
+        default_host = DEFAULT_HOST
+        default_port = str(PORT)
+
+        self.server_host.setText(default_host)
+        self.server_port.setText(default_port)
+
+        self.parent().server_host = default_host
+        self.parent().server_port = PORT
+        self.parent().settings["server_host"] = default_host
+        self.parent().settings["server_port"] = PORT
+        save_settings(self.parent().settings)
+
+        self.status.setProperty("role", "muted")
+        self.style().unpolish(self.status)
+        self.style().polish(self.status)
+        self.status.setText(f"Server reset to {default_host}:{PORT}")
+
     def submit(self, mode):
         username = self.username.text().strip()
         password = self.password.text()
+        host = self.server_host.text().strip()
+        port_text = self.server_port.text().strip()
+        if not host:
+            self.status.setText("Enter a server address.")
+            self.server_host.setFocus()
+            return
+        try:
+            port = int(port_text)
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            self.status.setText("Server port must be 1-65535.")
+            self.server_port.setFocus()
+            return
         if not username:
             self.status.setText("Enter a username.")
             self.username.setFocus()
@@ -461,6 +571,11 @@ class AuthDialog(QDialog):
             self.status.setText("Enter a password.")
             self.password.setFocus()
             return
+        self.parent().server_host = host
+        self.parent().server_port = port
+        self.parent().settings["server_host"] = host
+        self.parent().settings["server_port"] = port
+        save_settings(self.parent().settings)
         self.status.setProperty("role", "muted")
         self.style().unpolish(self.status)
         self.style().polish(self.status)
@@ -498,8 +613,13 @@ class FullDiscordClone(QMainWindow):
         if self.theme_name not in THEMES:
             self.theme_name = "NETRA Terminal"
 
-        self.server_host = DEFAULT_HOST
-        self.server_port = PORT
+        self.server_host = str(self.settings.get("server_host", DEFAULT_HOST)).strip() or DEFAULT_HOST
+        try:
+            self.server_port = int(self.settings.get("server_port", PORT))
+        except (TypeError, ValueError):
+            self.server_port = PORT
+        if not 1 <= self.server_port <= 65535:
+            self.server_port = PORT
         self.client_socket: Optional[socket.socket] = None
         self.send_lock = threading.Lock()
         self.network_worker: Optional[NetworkWorker] = None
@@ -513,6 +633,7 @@ class FullDiscordClone(QMainWindow):
         self.chat_history = {"general-chat": [], "random": []}
         self._load_chat_cache()
         self.dm_partners = []
+        self.unread_counts = {}
         self.last_registered_users = []
         self.online_users = set()
         self.voice_users = []
@@ -531,10 +652,74 @@ class FullDiscordClone(QMainWindow):
         self.voice_activity = {}
         self.voice_levels = {}
         self.voice_wave_labels = {}
+        self.voice_wave_state = {}
+        self.voice_hud_cards = {}
+        self.voice_hud_wave_labels = {}
+        self.voice_hud_status_labels = {}
+        self.pinned_messages = {}
+        self.deleted_undo = None
+        self.last_disconnect_at = None
+        self.notification_settings = dict(self.settings.get("notification_settings", {}) or {})
+        self.notification_history = list(self.settings.get("notification_history", []) or [])[-200:]
+        self.drafts = dict(self.settings.get("drafts", {}) or {})
+        self.recent_targets = list(self.settings.get("recent_targets", []) or [])[-20:]
+        self.dnd_mode = bool(self.settings.get("dnd_mode", False))
+        self.rich_presence = dict(self.settings.get("rich_presence", {}) or {})
+        self.rich_presence.setdefault("enabled", True)
+        self.rich_presence.setdefault("activity", "Using NETRA")
+        self.rich_presence.setdefault("details", "Online")
+        self.rich_presence.setdefault("state", "")
+        self.rich_presence.setdefault("show_server", True)
+        self.customization = dict(self.settings.get("customization", {}) or {})
+        self.customization.setdefault("accent", "")
+        self.customization.setdefault("font_size", 12)
+        self.customization.setdefault("density", "Comfortable")
+        self.music_playlists = dict(self.settings.get("music_playlists", {}) or {})
+        self.music_playlists.setdefault("Favorites", [])
+        self.active_playlist = str(self.settings.get("active_playlist", "Favorites"))
+        self.client_plugins = dict(self.settings.get("client_plugins", {}) or {})
+        self.server_plugins = dict(self.settings.get("server_plugins", {}) or {})
+        self.developer_mode = bool(self.settings.get("developer_mode", False))
+        self.screen_share_quality = str(self.settings.get("screen_share_quality", "Balanced"))
+        self.screen_share_source = str(self.settings.get("screen_share_source", "Virtual Desktop"))
+        self.screen_share_fps = int(self.settings.get("screen_share_fps", 30) or 30)
+        self.screen_share_cursor = bool(self.settings.get("screen_share_cursor", True))
+        self.screen_share_bounds = None
+        self.screen_sharing = False
+        self.voice_floating_window = None
+        self.voice_hud_expanded = False
+        self.vc_room_window = None
+        self.vc_room_users_list = None
+        self.vc_room_share_label = None
+        self.vc_room_share_status = None
+        self.screen_share_timer = None
+        self.screen_capture_thread = None
+        self.screen_capture_stop = threading.Event()
+        self.screen_capture_lock = threading.Lock()
+        self.screen_capture_pending = None
+        self.screen_capture_source_bounds = None
+        self.screen_share_dialog = None
+        self.screen_share_preview_label = None
+        self.screen_share_source_combo = None
+        self.screen_share_fps = 30
+        self.screen_share_last_frame = None
+        self.connection_started_at = None
+        self.last_ping_ms = None
         self.loading_history = False
         self._chat_cache_dirty = False
         self._render_generation = 0
         self.offline_mode = False
+        # Server-authoritative music state. Playback is shared by everyone in voice.
+        self.music_state = {"queue": [], "index": 0, "current": None, "playing": False, "paused": False, "position": 0.0}
+        self.music_dialog = None
+        self.music_listening = False
+        self.music_play_queue = queue.Queue(maxsize=120)
+        self.music_output_stream = None
+        self._local_music_thread = None
+        self._local_music_stop = False
+        self.music_output_stream = None
+        self.music_output_resampler = None
+        self.music_listener_thread = None
         self._last_password = ""
         self._last_auth_mode = "LOGIN"
         self._reconnect_timer = QTimer(self)
@@ -546,6 +731,15 @@ class FullDiscordClone(QMainWindow):
         self._incoming_file_transfers = {}
         self._file_send_lock = threading.Lock()
         self._file_receive_lock = threading.Lock()
+        self.netra_version = "0.2.0"
+        self.netra_build = "2026.09.26"
+        self.debug_log = list(self.settings.get("debug_log", []) or [])[-1000:]
+        self.remember_username = bool(self.settings.get("remember_username", True))
+        self.auto_open_images = bool(self.settings.get("auto_open_images", True))
+        self.desktop_notifications = bool(self.settings.get("desktop_notifications", False))
+        self.notification_sound_enabled = bool(self.settings.get("notification_sound_enabled", True))
+        self.ui_scale = int(self.settings.get("ui_scale", 100) or 100)
+        self.ptt_key = str(self.settings.get("ptt_key", "Control"))
 
         self.voice_muted = False
         self.in_voice_chat = False
@@ -581,10 +775,12 @@ class FullDiscordClone(QMainWindow):
         self.pil_profile = self._load_profile_image()
 
         self.setWindowTitle("NETRA // TERMINAL")
+        self.setAcceptDrops(True)
         self.resize(1200, 760)
         self.setMinimumSize(980, 640)
         self._install_icon()
         self._build_ui()
+        self._setup_notifications()
         self._apply_theme()
 
         self.timer = QTimer(self)
@@ -595,10 +791,78 @@ class FullDiscordClone(QMainWindow):
         self.voice_stats_timer.timeout.connect(self._update_voice_stats)
         self.voice_stats_timer.start(100)
 
+        self.presence_timer = QTimer(self)
+        self.presence_timer.timeout.connect(self._broadcast_rich_presence)
+        self.presence_timer.start(30000)
+
         self._connect_after_start = QTimer(self)
         self._connect_after_start.setSingleShot(True)
         self._connect_after_start.timeout.connect(self.show_auth)
         self._connect_after_start.start(250)
+        self._log_debug("NETRA started")
+
+    def _show_while_away(self, seconds):
+        unread = sum(max(0, int(v)) for v in self.unread_counts.values())
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // WHILE YOU WERE AWAY")
+        dialog.setFixedSize(460, 260)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        title = QLabel("WHILE YOU WERE AWAY")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        mins = seconds // 60
+        secs = seconds % 60
+        layout.addWidget(QLabel(f"Connection was away for {mins}m {secs}s."))
+        layout.addWidget(QLabel(f"Unread notifications: {unread}"))
+        layout.addWidget(QLabel(f"Cached rooms: {len(self.chat_history)}"))
+        close = QPushButton("CONTINUE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    # ---------- notifications ----------
+
+    def _setup_notifications(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.windowIcon())
+        self.tray_icon.setToolTip("NETRA")
+        self.tray_icon.activated.connect(lambda reason: self.showNormal() if reason == QSystemTrayIcon.Trigger else None)
+        # Notifications stay inside NETRA. No Windows bottom-right toast popups.
+        self.tray_icon.hide()
+
+    def _notify_incoming(self, room, sender, text):
+        if not sender or sender == self.username:
+            return
+        if room == self.current_target and self.isActiveWindow() and not self.isMinimized():
+            return
+        if self.notification_settings.get(room, True) is False:
+            return
+
+        self.unread_counts[room] = int(self.unread_counts.get(room, 0)) + 1
+        self.notification_history.append({
+            "room": str(room),
+            "sender": str(sender),
+            "text": str(text or "New message"),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        self.notification_history = self.notification_history[-200:]
+        self.settings["notification_history"] = self.notification_history
+        save_settings(self.settings)
+        self._refresh_notification_badges()
+        if self.notification_sound_enabled:
+            self.play_ping_sound()
+
+    def _refresh_notification_badges(self):
+        total = sum(max(0, int(v)) for v in self.unread_counts.values())
+        self.dm_button.setText(f"💬 {total}" if total else "💬")
+        self.dm_button.setToolTip(f"Direct Messages — {total} unread" if total else "Direct Messages")
+        self._refresh_dm_list()
+
+    def _mark_room_read(self, room):
+        if room in self.unread_counts:
+            self.unread_counts.pop(room, None)
+        self._refresh_notification_badges()
 
     # ---------- styling ----------
 
@@ -610,12 +874,20 @@ class FullDiscordClone(QMainWindow):
         return self._stylesheet(c, dialog=True)
 
     def _stylesheet(self, c, dialog=False):
+        accent = self.customization.get("accent", "") if hasattr(self, "customization") else ""
+        if accent:
+            c = dict(c)
+            c["bright"] = accent
+            c["active"] = accent
+        font_size = int(self.customization.get("font_size", 12)) if hasattr(self, "customization") else 12
+        density = self.customization.get("density", "Comfortable") if hasattr(self, "customization") else "Comfortable"
+        padding = {"Compact": "3px 5px", "Comfortable": "4px 6px", "Spacious": "7px 9px"}.get(density, "4px 6px")
         return f"""
         QWidget {{
             color: {c['bright']};
             background: {c['root']};
             font-family: Consolas;
-            font-size: 12px;
+            font-size: {font_size}px;
         }}
         QMainWindow {{ background: {c['root']}; }}
         QLabel {{ background: transparent; }}
@@ -662,7 +934,7 @@ class FullDiscordClone(QMainWindow):
             color: {c['bright']};
             border: 1px solid {c['border']};
             border-radius: 0px;
-            padding: 4px 6px;
+            padding: {padding};
             font-family: Consolas;
             font-size: 10px;
         }}
@@ -826,6 +1098,26 @@ class FullDiscordClone(QMainWindow):
         self.rename_button.setFixedHeight(22)
         self.rename_button.clicked.connect(self.rename_username)
         profile_layout.addWidget(self.rename_button)
+        self.status_button = QPushButton("CUSTOM STATUS")
+        self.status_button.setFixedHeight(22)
+        self.status_button.clicked.connect(self.edit_custom_status)
+        profile_layout.addWidget(self.status_button)
+        self.customize_button = QPushButton("CUSTOMIZE")
+        self.customize_button.setFixedHeight(22)
+        self.customize_button.clicked.connect(self.open_customization)
+        profile_layout.addWidget(self.customize_button)
+        self.presence_button = QPushButton("RICH PRESENCE")
+        self.presence_button.setFixedHeight(22)
+        self.presence_button.clicked.connect(self.open_rich_presence)
+        profile_layout.addWidget(self.presence_button)
+        self.notifications_button = QPushButton("NOTIFICATIONS")
+        self.notifications_button.setFixedHeight(22)
+        self.notifications_button.clicked.connect(self.open_notification_center)
+        profile_layout.addWidget(self.notifications_button)
+        self.tools_button = QPushButton("NETRA TOOLS")
+        self.tools_button.setFixedHeight(22)
+        self.tools_button.clicked.connect(self.open_netra_tools)
+        profile_layout.addWidget(self.tools_button)
         side.addWidget(profile)
         root.addWidget(self.sidebar)
 
@@ -846,7 +1138,7 @@ class FullDiscordClone(QMainWindow):
         self.server_ip_entry = QLineEdit(self.server_host)
         self.server_ip_entry.setFixedWidth(220)
         self.server_ip_entry.setFixedHeight(30)
-        self.server_ip_entry.setReadOnly(True)
+        self.server_ip_entry.setPlaceholderText("IP address or hostname")
         server_bar_layout.addWidget(self.server_ip_entry)
         self.server_connect_btn = QPushButton("CONNECT")
         self.server_connect_btn.setFixedWidth(90)
@@ -869,6 +1161,26 @@ class FullDiscordClone(QMainWindow):
         header.addStretch(1)
         self.chat_status_label = QLabel("offline")
         header.addWidget(self.chat_status_label)
+        self.search_button = QPushButton("SEARCH")
+        self.search_button.setFixedHeight(24)
+        self.search_button.clicked.connect(self.global_search)
+        header.addWidget(self.search_button)
+        self.pin_button = QPushButton("PINS")
+        self.pin_button.setFixedHeight(24)
+        self.pin_button.clicked.connect(self.show_pinned_messages)
+        header.addWidget(self.pin_button)
+        self.files_button = QPushButton("FILES")
+        self.files_button.setFixedHeight(24)
+        self.files_button.clicked.connect(self.open_files_gallery)
+        header.addWidget(self.files_button)
+        self.music_button = QPushButton("MUSIC")
+        self.music_button.setFixedHeight(24)
+        self.music_button.clicked.connect(self.open_music_player)
+        header.addWidget(self.music_button)
+        self.notify_button = QPushButton("NOTIFY")
+        self.notify_button.setFixedHeight(24)
+        self.notify_button.clicked.connect(self.toggle_channel_notifications)
+        header.addWidget(self.notify_button)
         chat_layout.addLayout(header)
 
         self.chat_scroll = QScrollArea()
@@ -884,6 +1196,8 @@ class FullDiscordClone(QMainWindow):
             self._on_chat_scroll_range_changed
         )
         chat_layout.addWidget(self.chat_scroll, 1)
+
+        self._build_voice_hud(chat_layout)
 
         compose_wrap = QVBoxLayout()
         compose_wrap.setSpacing(4)
@@ -913,6 +1227,16 @@ class FullDiscordClone(QMainWindow):
         self.file_button.setFixedSize(58, 44)
         self.file_button.clicked.connect(self.choose_file_to_send)
         compose.addWidget(self.file_button)
+        self.paste_image_button = QPushButton("PASTE")
+        self.paste_image_button.setFixedSize(62, 44)
+        self.paste_image_button.setToolTip("Paste an image from the clipboard")
+        self.paste_image_button.clicked.connect(self.paste_clipboard_image)
+        compose.addWidget(self.paste_image_button)
+        self.emoji_button = QPushButton("😊")
+        self.emoji_button.setFixedSize(44, 44)
+        self.emoji_button.setToolTip("Emoji picker (Ctrl+E)")
+        self.emoji_button.clicked.connect(self.open_emoji_picker)
+        compose.addWidget(self.emoji_button)
         self.poll_button = QPushButton("POLL")
         self.poll_button.setFixedSize(58, 44)
         self.poll_button.clicked.connect(self.create_poll)
@@ -944,6 +1268,7 @@ class FullDiscordClone(QMainWindow):
         self.members_header = QLabel("MEMBERS")
         mem.addWidget(self.members_header)
         self.members_list = QListWidget()
+        self.members_list.itemClicked.connect(self._member_item_clicked)
         mem.addWidget(self.members_list, 1)
         root.addWidget(self.members)
 
@@ -958,6 +1283,275 @@ class FullDiscordClone(QMainWindow):
         self.reload_current_chat_view()
         self._build_settings_panel()
         self._apply_widget_theme(self.palette_colors())
+
+    def _build_voice_hud(self, parent_layout):
+        """Persistent compact VC HUD that stays visible while browsing NETRA."""
+        self.voice_hud = QFrame(objectName="panelAlt")
+        self.voice_hud.setMinimumHeight(92)
+        self.voice_hud.setMaximumHeight(112)
+        hud_layout = QVBoxLayout(self.voice_hud)
+        hud_layout.setContentsMargins(8, 6, 8, 6)
+        hud_layout.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.voice_hud_title = QLabel("🔊 VOICE HUD")
+        self.voice_hud_title.setProperty("role", "title")
+        top.addWidget(self.voice_hud_title)
+        self.voice_hud_count = QLabel("OFFLINE")
+        self.voice_hud_count.setProperty("role", "muted")
+        top.addWidget(self.voice_hud_count)
+        top.addStretch(1)
+
+        self.voice_hud_mic = QPushButton("🎤 MIC")
+        self.voice_hud_mic.setFixedHeight(25)
+        self.voice_hud_mic.clicked.connect(self.toggle_voice_mute)
+        top.addWidget(self.voice_hud_mic)
+
+        self.voice_hud_audio = QPushButton("🔊 AUDIO")
+        self.voice_hud_audio.setFixedHeight(25)
+        self.voice_hud_audio.clicked.connect(self.open_settings)
+        top.addWidget(self.voice_hud_audio)
+
+        self.voice_hud_music = QPushButton("🎵 MUSIC")
+        self.voice_hud_music.setFixedHeight(25)
+        self.voice_hud_music.clicked.connect(self.open_music_player)
+        top.addWidget(self.voice_hud_music)
+
+        self.voice_hud_expand = QPushButton("⤢")
+        self.voice_hud_expand.setFixedSize(32, 25)
+        self.voice_hud_expand.setToolTip("Expand VC")
+        self.voice_hud_expand.clicked.connect(self.toggle_voice_hud_expand)
+        top.addWidget(self.voice_hud_expand)
+
+        self.voice_hud_settings = QPushButton("⚙")
+        self.voice_hud_settings.setFixedSize(30, 25)
+        self.voice_hud_settings.setToolTip("Voice settings")
+        self.voice_hud_settings.clicked.connect(self.open_settings)
+        top.addWidget(self.voice_hud_settings)
+        hud_layout.addLayout(top)
+
+        self.voice_hud_scroll = QScrollArea()
+        self.voice_hud_scroll.setWidgetResizable(True)
+        self.voice_hud_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.voice_hud_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.voice_hud_scroll.setFrameShape(QFrame.NoFrame)
+        self.voice_hud_content = QWidget()
+        self.voice_hud_row = QHBoxLayout(self.voice_hud_content)
+        self.voice_hud_row.setContentsMargins(0, 0, 0, 0)
+        self.voice_hud_row.setSpacing(6)
+        self.voice_hud_row.addStretch(1)
+        self.voice_hud_scroll.setWidget(self.voice_hud_content)
+        hud_layout.addWidget(self.voice_hud_scroll, 1)
+
+        # Expanded VC workspace lives inside the normal bottom bar.  It is not
+        # a separate pop-out window; expanding simply takes over the chat area.
+        self.voice_hud_expanded_panel = QFrame(objectName="panel")
+        expanded_layout = QVBoxLayout(self.voice_hud_expanded_panel)
+        expanded_layout.setContentsMargins(8, 6, 8, 6)
+        expanded_layout.setSpacing(6)
+        expanded_header = QHBoxLayout()
+        expanded_header.addWidget(QLabel("🔊 VOICE ROOM"))
+        self.voice_hud_expanded_count = QLabel("0 IN VC")
+        self.voice_hud_expanded_count.setProperty("role", "muted")
+        expanded_header.addWidget(self.voice_hud_expanded_count)
+        expanded_header.addStretch(1)
+        share_btn = QPushButton("🖥 SCREEN SHARE")
+        share_btn.clicked.connect(self.open_screen_share)
+        expanded_header.addWidget(share_btn)
+        music_btn = QPushButton("🎵 MUSIC")
+        music_btn.clicked.connect(self.open_music_player)
+        expanded_header.addWidget(music_btn)
+        collapse_btn = QPushButton("↙ COLLAPSE")
+        collapse_btn.clicked.connect(self.toggle_voice_hud_expand)
+        expanded_header.addWidget(collapse_btn)
+        expanded_layout.addLayout(expanded_header)
+
+        expanded_body = QHBoxLayout()
+        self.voice_hud_expanded_users = QListWidget()
+        self.voice_hud_expanded_users.setMinimumWidth(250)
+        expanded_body.addWidget(self.voice_hud_expanded_users)
+        self.voice_hud_expanded_share = QLabel("SCREEN SHARE\nNothing is being shared.")
+        self.voice_hud_expanded_share.setAlignment(Qt.AlignCenter)
+        self.voice_hud_expanded_share.setMinimumHeight(280)
+        self.voice_hud_expanded_share.setStyleSheet("border:1px solid rgba(255,255,255,35); background:rgba(0,0,0,80); border-radius:8px;")
+        expanded_body.addWidget(self.voice_hud_expanded_share, 1)
+        expanded_layout.addLayout(expanded_body, 1)
+
+        expanded_controls = QHBoxLayout()
+        self.voice_hud_expanded_mic = QPushButton("🎤 MIC")
+        self.voice_hud_expanded_mic.clicked.connect(self.toggle_voice_mute)
+        expanded_controls.addWidget(self.voice_hud_expanded_mic)
+        self.voice_hud_expanded_deaf = QPushButton("🔊 AUDIO")
+        self.voice_hud_expanded_deaf.clicked.connect(self.toggle_deafen)
+        expanded_controls.addWidget(self.voice_hud_expanded_deaf)
+        expanded_controls.addStretch(1)
+        leave_btn = QPushButton("LEAVE VC")
+        leave_btn.clicked.connect(self.stop_voice_chat)
+        expanded_controls.addWidget(leave_btn)
+        expanded_layout.addLayout(expanded_controls)
+        self.voice_hud_expanded_panel.setVisible(False)
+        hud_layout.addWidget(self.voice_hud_expanded_panel, 1)
+
+        parent_layout.addWidget(self.voice_hud)
+        self.voice_hud.setVisible(bool(self.in_voice_chat))
+        self._refresh_voice_hud()
+
+    def toggle_voice_hud_expand(self):
+        if not self.in_voice_chat:
+            return
+        self.voice_hud_expanded = not self.voice_hud_expanded
+        expanded = self.voice_hud_expanded
+        # The bar remains docked above the composer; the chat viewport yields
+        # its space so the VC workspace fills the available central area.
+        self.chat_scroll.setVisible(not expanded)
+        self.voice_hud_scroll.setVisible(not expanded)
+        self.voice_hud_expanded_panel.setVisible(expanded)
+        if expanded:
+            self.voice_hud.setMinimumHeight(0)
+            self.voice_hud.setMaximumHeight(16777215)
+            self.voice_hud_expand.setText("↙")
+            self.voice_hud_expand.setToolTip("Collapse VC")
+            self.voice_hud_title.setText("🔊 VOICE ROOM  //  FULL")
+        else:
+            self.voice_hud.setMinimumHeight(92)
+            self.voice_hud.setMaximumHeight(112)
+            self.voice_hud_expand.setText("⤢")
+            self.voice_hud_expand.setToolTip("Expand VC")
+            self.voice_hud_title.setText("🔊 VOICE HUD  //  LIVE")
+        self._refresh_voice_hud()
+        self._update_voice_hud_expanded()
+
+    def _update_voice_hud_expanded(self):
+        if not getattr(self, "voice_hud_expanded", False) or not self.in_voice_chat:
+            return
+        users = list(dict.fromkeys(self.voice_users or [self.username]))
+        self.voice_hud_expanded_count.setText(f"{len(users)} IN VC")
+        self.voice_hud_expanded_users.clear()
+        bars = "▁▂▃▄▅▆▇█"
+        for user in users:
+            state = self.voice_wave_state.get(user, {})
+            level = float(state.get("level", 0.0) or 0.0)
+            history = list(state.get("history", [0.0] * 7))[-7:]
+            wave = "".join(bars[min(7, int(max(0.0, v) * 8.0))] for v in history)
+            muted = bool(self.voice_user_mutes.get(user, False)) if user != self.username else self.voice_muted
+            state_text = "MUTED" if muted else ("SPEAKING" if level > 0.035 else "LISTENING")
+            self.voice_hud_expanded_users.addItem(f"{'🟢' if level > 0.035 else '⚪'} {user}   {state_text}\n   {wave}")
+        self.voice_hud_expanded_mic.setText("🔇 MIC OFF" if self.voice_muted else "🎤 MIC")
+        self.voice_hud_expanded_deaf.setText("🔇 DEAFENED" if self.voice_deafened else "🔊 AUDIO")
+        if self.screen_sharing and self.screen_share_last_frame is not None:
+            self.voice_hud_expanded_share.setPixmap(self.pil_to_pixmap(self.screen_share_last_frame, (900, 520)))
+            self.voice_hud_expanded_share.setText("")
+        else:
+            self.voice_hud_expanded_share.setPixmap(QPixmap())
+            self.voice_hud_expanded_share.setText("SCREEN SHARE\nNothing is being shared.")
+
+    def _clear_voice_hud_cards(self):
+        while self.voice_hud_row.count():
+            item = self.voice_hud_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.voice_hud_cards = {}
+        self.voice_hud_wave_labels = {}
+        self.voice_hud_status_labels = {}
+        self.voice_hud_row.addStretch(1)
+
+    def _refresh_voice_hud(self):
+        if not hasattr(self, "voice_hud"):
+            return
+
+        # The HUD is only part of the layout while actually connected to VC.
+        # Do not leave an empty/offline panel taking up chat space.
+        if not self.in_voice_chat:
+            self.voice_hud.setVisible(False)
+            self._clear_voice_hud_cards()
+            return
+
+        self.voice_hud.setVisible(True)
+        self._clear_voice_hud_cards()
+        users = list(dict.fromkeys(self.voice_users or [self.username]))
+        self.voice_hud_title.setText("🔊 VOICE HUD  //  LIVE")
+        self.voice_hud_count.setText(f"{len(users)} IN VC")
+        for user in users:
+            card = QFrame(objectName="panel")
+            card.setMinimumWidth(180)
+            card.setMaximumWidth(230)
+            card_layout = QHBoxLayout(card)
+            card_layout.setContentsMargins(6, 4, 6, 4)
+            card_layout.setSpacing(5)
+
+            avatar = QLabel()
+            avatar.setFixedSize(30, 30)
+            avatar.setAlignment(Qt.AlignCenter)
+            avatar_img = self.user_pfps.get(user, Image.new("RGB", (40, 40), "#0F3D0F"))
+            avatar.setPixmap(self.pil_to_pixmap(avatar_img, (30, 30)))
+            card_layout.addWidget(avatar)
+
+            text_col = QVBoxLayout()
+            text_col.setContentsMargins(0, 0, 0, 0)
+            text_col.setSpacing(0)
+            name = QLabel(("YOU" if user == self.username else user))
+            name.setProperty("role", "memberName")
+            text_col.addWidget(name)
+            status = QLabel("MIC ON")
+            status.setProperty("role", "muted")
+            text_col.addWidget(status)
+            card_layout.addLayout(text_col, 1)
+
+            wave = QLabel("▁▁▁▁▁▁▁")
+            wave.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            wave.setFixedWidth(70)
+            wave.setStyleSheet(f"color:{self.palette_colors()['dim']}; font-family:Consolas; font-size:12px; font-weight:700;")
+            card_layout.addWidget(wave)
+
+            self.voice_hud_cards[user] = card
+            self.voice_hud_wave_labels[user] = wave
+            self.voice_hud_status_labels[user] = status
+            self.voice_hud_row.insertWidget(self.voice_hud_row.count() - 1, card)
+
+        self.voice_hud_mic.setText("🔇 MIC OFF" if self.voice_muted else "🎤 MIC")
+        if hasattr(self, "voice_hud_audio"):
+            self.voice_hud_audio.setText("🔇 DEAFENED" if self.voice_deafened else "🔊 AUDIO")
+
+    def _update_voice_hud(self):
+        if not hasattr(self, "voice_hud"):
+            return
+        if not self.in_voice_chat:
+            if self.voice_hud.isVisible():
+                self.voice_hud.setVisible(False)
+            return
+        if not self.voice_hud.isVisible():
+            self.voice_hud.setVisible(True)
+            self._refresh_voice_hud()
+        users = list(dict.fromkeys(self.voice_users or [self.username]))
+        if set(users) != set(self.voice_hud_cards):
+            self._refresh_voice_hud()
+        self.voice_hud_count.setText(f"{len(users)} IN VC")
+        bars = "▁▂▃▄▅▆▇█"
+        for user in users:
+            wave = self.voice_hud_wave_labels.get(user)
+            status = self.voice_hud_status_labels.get(user)
+            if wave is None:
+                continue
+            state = self.voice_wave_state.get(user, {})
+            level = float(state.get("level", 0.0) or 0.0)
+            history = list(state.get("history", [0.0] * 7))[-7:]
+            wave.setText("".join(bars[min(7, int(max(0.0, v) * 8.0))] for v in history))
+            active = level > 0.035
+            wave.setStyleSheet(
+                f"color:{self.palette_colors()['bright'] if active else self.palette_colors()['dim']}; "
+                "font-family:Consolas; font-size:12px; font-weight:700;"
+            )
+            if status:
+                if user == self.username:
+                    status.setText("MIC OFF" if self.voice_muted else ("SPEAKING" if active else "MIC ON"))
+                else:
+                    status.setText("SPEAKING" if active else "MIC ON")
+
+        self.voice_hud_mic.setText("🔇 MIC OFF" if self.voice_muted else "🎤 MIC")
+        self.voice_hud_audio.setText("🔇 DEAFENED" if self.voice_deafened else "🔊 AUDIO")
+        self._update_voice_hud_expanded()
 
     def _build_settings_panel(self):
         # Full in-app NETRA settings panel.  The content itself scrolls; the
@@ -1030,6 +1624,51 @@ class FullDiscordClone(QMainWindow):
         row.addWidget(self.sound_combo, 1)
         gl.addLayout(row)
         body_layout.addWidget(general)
+
+        # ---- 0.2 client controls ----
+        client20, c20 = section("NETRA 0.2 CLIENT")
+        c20.addWidget(QLabel("Client-only improvements are stored locally and do not require Server.py changes."))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("UI scale"))
+        self.ui_scale_combo = QComboBox()
+        self.ui_scale_combo.addItems(["80%", "90%", "100%", "110%", "125%", "150%"] )
+        self.ui_scale_combo.setCurrentText(f"{self.ui_scale}%")
+        self.ui_scale_combo.currentTextChanged.connect(self._apply_ui_scale_setting)
+        row.addWidget(self.ui_scale_combo, 1)
+        c20.addLayout(row)
+        self.remember_username_cb = QCheckBox("Remember username")
+        self.remember_username_cb.setChecked(self.remember_username)
+        self.remember_username_cb.stateChanged.connect(lambda v: setattr(self, "remember_username", bool(v)))
+        c20.addWidget(self.remember_username_cb)
+        self.auto_open_images_cb = QCheckBox("Automatically download and display images")
+        self.auto_open_images_cb.setChecked(self.auto_open_images)
+        self.auto_open_images_cb.stateChanged.connect(lambda v: setattr(self, "auto_open_images", bool(v)))
+        c20.addWidget(self.auto_open_images_cb)
+        self.desktop_notifications_cb = QCheckBox("In-app notification center alerts")
+        self.desktop_notifications_cb.setChecked(self.desktop_notifications)
+        self.desktop_notifications_cb.stateChanged.connect(lambda v: setattr(self, "desktop_notifications", bool(v)))
+        c20.addWidget(self.desktop_notifications_cb)
+        ptt_row = QHBoxLayout()
+        ptt_row.addWidget(QLabel("Push-to-talk key"))
+        self.ptt_key_combo = QComboBox()
+        self.ptt_key_combo.addItems(["Control", "Shift", "Alt", "Space"])
+        self.ptt_key_combo.setCurrentText(self.ptt_key if self.ptt_key in ["Control","Shift","Alt","Space"] else "Control")
+        self.ptt_key_combo.currentTextChanged.connect(lambda v: setattr(self, "ptt_key", v))
+        ptt_row.addWidget(self.ptt_key_combo, 1)
+        c20.addLayout(ptt_row)
+        tools = QGridLayout()
+        for i, (label, fn) in enumerate([
+            ("IMPORT SETTINGS", self.import_settings), ("EXPORT SETTINGS", self.export_settings),
+            ("RESET UI", self.reset_ui_preferences), ("RESET SETTINGS", self.reset_all_settings),
+            ("DEBUG LOG", self.open_debug_log), ("IMAGE CACHE", self.open_files_gallery),
+            ("GLOBAL SEARCH", self.global_search), ("NOTIFICATIONS", self.open_notification_center),
+        ]):
+            b = QPushButton(label); b.setFixedHeight(28); b.clicked.connect(fn); tools.addWidget(b, i // 2, i % 2)
+        c20.addLayout(tools)
+        version = QLabel(f"NETRA {self.netra_version} // build {self.netra_build} // client-only release")
+        version.setProperty("role", "muted")
+        c20.addWidget(version)
+        body_layout.addWidget(client20)
 
         # ---- Voice devices ----
         devices, vl = section("VOICE")
@@ -1157,6 +1796,9 @@ class FullDiscordClone(QMainWindow):
             ("PROFILE / PFP", self.upload_pfp),
             ("CHANGE USERNAME", self.rename_username),
             ("THEMES", lambda: self.theme_combo.setFocus()),
+            ("CUSTOMIZE UI", self.open_customization),
+            ("NOTIFICATIONS", self.open_notification_center),
+            ("RICH PRESENCE", self.open_rich_presence),
             ("FULLSCREEN", self.toggle_fullscreen),
         ]
         for i, (label, fn) in enumerate(actions):
@@ -1351,9 +1993,1120 @@ class FullDiscordClone(QMainWindow):
     def _set_voice_test_status(self, text, error):
         self.voice_test_signals.result.emit(text, error)
 
-    # ---------- dialogs / settings ----------
+    # ---------- NETRA feature pack ----------
+
+    def _save_feature_settings(self):
+        self.settings.update({
+            "notification_history": self.notification_history[-200:],
+            "rich_presence": self.rich_presence,
+            "customization": self.customization,
+            "music_playlists": self.music_playlists,
+            "active_playlist": self.active_playlist,
+            "client_plugins": self.client_plugins,
+            "server_plugins": self.server_plugins,
+            "developer_mode": self.developer_mode,
+            "screen_share_quality": self.screen_share_quality,
+            "screen_share_source": self.screen_share_source,
+            "screen_share_fps": self.screen_share_fps,
+            "screen_share_cursor": self.screen_share_cursor,
+            "offline_mode": self.offline_mode,
+        })
+        save_settings(self.settings)
+
+    def open_notification_center(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // NOTIFICATION CENTER")
+        dialog.resize(620, 520)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        title = QLabel("NOTIFICATION CENTER")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        sub = QLabel("In-app notifications only — Windows toast alerts are disabled.")
+        sub.setProperty("role", "muted")
+        layout.addWidget(sub)
+        items = QListWidget()
+        for item in reversed(self.notification_history[-200:]):
+            room = item.get("room", "?")
+            sender = item.get("sender", "?")
+            text_value = str(item.get("text", "")).replace("\\n", " ")
+            stamp = item.get("time", "")
+            label = f"{stamp}   {sender}  →  {room}   {text_value[:180]}"
+            items.addItem(label)
+        layout.addWidget(items, 1)
+        buttons = QHBoxLayout()
+        mark = QPushButton("MARK ALL READ")
+        mark.clicked.connect(lambda: (self.unread_counts.clear(), self._refresh_notification_badges(), dialog.accept()))
+        buttons.addWidget(mark)
+        clear = QPushButton("CLEAR HISTORY")
+        def clear_history():
+            self.notification_history.clear()
+            self.settings["notification_history"] = []
+            save_settings(self.settings)
+            items.clear()
+        clear.clicked.connect(clear_history)
+        buttons.addWidget(clear)
+        buttons.addStretch(1)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def open_customization(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // CUSTOMIZATION")
+        dialog.resize(560, 470)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        title = QLabel("CUSTOMIZATION")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        layout.addWidget(QLabel("Customize NETRA independently from the main settings menu."))
+
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Theme"))
+        theme = QComboBox()
+        theme.addItems(list(THEMES.keys()))
+        theme.setCurrentText(self.theme_name)
+        theme.currentTextChanged.connect(self.change_theme)
+        theme_row.addWidget(theme, 1)
+        layout.addLayout(theme_row)
+
+        accent_row = QHBoxLayout()
+        accent_row.addWidget(QLabel("Accent color"))
+        accent = QLineEdit(str(self.customization.get("accent", "")))
+        accent.setPlaceholderText("#33FF33 or blank for theme default")
+        accent_row.addWidget(accent, 1)
+        layout.addLayout(accent_row)
+
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("UI font size"))
+        font = QSlider(Qt.Horizontal)
+        font.setRange(9, 18)
+        font.setValue(int(self.customization.get("font_size", 12)))
+        font_value = QLabel(str(font.value()))
+        font.valueChanged.connect(lambda v: font_value.setText(str(v)))
+        font_row.addWidget(font, 1)
+        font_row.addWidget(font_value)
+        layout.addLayout(font_row)
+
+        density_row = QHBoxLayout()
+        density_row.addWidget(QLabel("Message density"))
+        density = QComboBox()
+        density.addItems(["Compact", "Comfortable", "Spacious"])
+        density.setCurrentText(str(self.customization.get("density", "Comfortable")))
+        density_row.addWidget(density, 1)
+        layout.addLayout(density_row)
+
+        preview = QLabel("Preview: NETRA // customization is applied when you press APPLY")
+        preview.setProperty("role", "muted")
+        preview.setWordWrap(True)
+        layout.addWidget(preview)
+        layout.addStretch(1)
+
+        buttons = QHBoxLayout()
+        reset = QPushButton("RESET CUSTOMIZATION")
+        def reset_custom():
+            self.customization = {"accent": "", "font_size": 12, "density": "Comfortable"}
+            self._save_feature_settings()
+            self._apply_theme()
+            dialog.accept()
+        reset.clicked.connect(reset_custom)
+        buttons.addWidget(reset)
+        buttons.addStretch(1)
+        apply_btn = QPushButton("APPLY")
+        def apply_custom():
+            value = accent.text().strip()
+            if value and not (value.startswith("#") and len(value) in (4, 7)):
+                QMessageBox.warning(dialog, "NETRA", "Accent must be a hex color such as #33FF33, or blank.")
+                return
+            self.customization = {"accent": value, "font_size": font.value(), "density": density.currentText()}
+            self._save_feature_settings()
+            self._apply_theme()
+            dialog.accept()
+        apply_btn.clicked.connect(apply_custom)
+        buttons.addWidget(apply_btn)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.reject)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def open_rich_presence(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // RICH PRESENCE")
+        dialog.setFixedSize(500, 390)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        title = QLabel("RICH PRESENCE")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        enabled = QCheckBox("Show Rich Presence")
+        enabled.setChecked(bool(self.rich_presence.get("enabled", True)))
+        layout.addWidget(enabled)
+        activity = QLineEdit(str(self.rich_presence.get("activity", "Using NETRA")))
+        activity.setPlaceholderText("Activity")
+        layout.addWidget(QLabel("ACTIVITY")); layout.addWidget(activity)
+        details = QLineEdit(str(self.rich_presence.get("details", "Online")))
+        details.setPlaceholderText("Details")
+        layout.addWidget(QLabel("DETAILS")); layout.addWidget(details)
+        state = QLineEdit(str(self.rich_presence.get("state", "")))
+        state.setPlaceholderText("State / extra line")
+        layout.addWidget(QLabel("STATE")); layout.addWidget(state)
+        show_server = QCheckBox("Show current server/channel")
+        show_server.setChecked(bool(self.rich_presence.get("show_server", True)))
+        layout.addWidget(show_server)
+        layout.addStretch(1)
+        buttons = QHBoxLayout(); buttons.addStretch(1)
+        save = QPushButton("SAVE")
+        def save_presence():
+            self.rich_presence = {"enabled": enabled.isChecked(), "activity": activity.text().strip() or "Using NETRA", "details": details.text().strip() or "Online", "state": state.text().strip(), "show_server": show_server.isChecked()}
+            self._save_feature_settings()
+            self._broadcast_rich_presence()
+            dialog.accept()
+        save.clicked.connect(save_presence); buttons.addWidget(save)
+        close = QPushButton("CLOSE"); close.clicked.connect(dialog.reject); buttons.addWidget(close)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def _broadcast_rich_presence(self):
+        if not self.rich_presence.get("enabled", True):
+            payload = {"enabled": False}
+        else:
+            payload = dict(self.rich_presence)
+            if payload.get("show_server", True):
+                payload["server"] = self.current_target or ""
+        try:
+            self._network_send("RICH_PRESENCE:" + json.dumps(payload, separators=(",", ":")), queue_offline=False)
+        except Exception:
+            pass
+
+    def open_netra_tools(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // TOOLS")
+        dialog.resize(560, 500)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        title = QLabel("NETRA TOOLS")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        buttons = [
+            ("NOTIFICATION CENTER", self.open_notification_center),
+            ("MUSIC PLAYER", self.open_music_player),
+            ("CONNECTION DIAGNOSTICS", self.open_connection_diagnostics),
+            ("PLUGIN MANAGER", self.open_plugin_manager),
+            ("SCREEN SHARE", self.open_screen_share),
+            ("COMMAND PALETTE", self.open_command_palette),
+            ("KEYBOARD SHORTCUTS", self.open_shortcuts),
+            ("0.2 QOL CENTER", self.open_qol_center),
+        ]
+        for label, fn in buttons:
+            b = QPushButton(label); b.setFixedHeight(34); b.clicked.connect(lambda checked=False, f=fn: (dialog.accept(), f())); layout.addWidget(b)
+        dev = QPushButton("DEVELOPER MODE" + (" [ON]" if self.developer_mode else " [OFF]"))
+        dev.setFixedHeight(34)
+        dev.clicked.connect(lambda: (dialog.accept(), self.open_developer_mode()))
+        layout.addWidget(dev)
+        layout.addStretch(1)
+        close = QPushButton("CLOSE"); close.clicked.connect(dialog.accept); layout.addWidget(close)
+        dialog.exec()
+
+    def open_connection_diagnostics(self):
+        dialog = QDialog(self); dialog.setWindowTitle("NETRA // CONNECTION DIAGNOSTICS"); dialog.resize(560, 430); dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog); title=QLabel("CONNECTION DIAGNOSTICS"); title.setProperty("role","title"); layout.addWidget(title)
+        info=QLabel(); info.setWordWrap(True); info.setProperty("role","muted"); layout.addWidget(info)
+        def refresh():
+            state = "OFFLINE" if self.offline_mode or not self.authenticated else "CONNECTED"
+            uptime = "n/a"
+            if self.connection_started_at: uptime = f"{max(0, time.monotonic()-self.connection_started_at):.1f}s"
+            info.setText("\n".join([
+                f"Status: {state}", f"Server: {self.server_host}:{self.server_port}", f"WebSocket/TCP: {'CONNECTED' if self.client_socket else 'DISCONNECTED'}",
+                f"Connection uptime: {uptime}", f"Reconnect attempts: {self._reconnect_attempts}", f"Last disconnect: {self.last_disconnect_at or 'none'}",
+                f"Voice: {'CONNECTED' if self.in_voice_chat else 'offline'}", f"Voice packets: {self.voice_packet_count}", f"Voice jitter: {self.voice_jitter_ms:.1f} ms",
+                f"Offline outbox: {len(self._outbox)}", f"Cached rooms: {len(self.chat_history)}", f"File cache: {FILE_CACHE_DIR}",
+            ]))
+        refresh(); layout.addStretch(1)
+        r=QPushButton("REFRESH"); r.clicked.connect(refresh); layout.addWidget(r)
+        close=QPushButton("CLOSE"); close.clicked.connect(dialog.accept); layout.addWidget(close); dialog.exec()
+
+    def open_developer_mode(self):
+        dialog = QDialog(self); dialog.setWindowTitle("NETRA // DEVELOPER MODE"); dialog.resize(640, 520); dialog.setStyleSheet(self.dialog_qss())
+        layout=QVBoxLayout(dialog); title=QLabel("DEVELOPER MODE"); title.setProperty("role","title"); layout.addWidget(title)
+        enabled=QCheckBox("Enable Developer Mode"); enabled.setChecked(self.developer_mode); layout.addWidget(enabled)
+        info=QLabel(); info.setWordWrap(True); info.setProperty("role","muted"); layout.addWidget(info)
+        def refresh():
+            info.setText(f"Username: {self.username}\nUser ID: {self.username}\nCurrent target: {self.current_target}\nServer: {self.server_host}:{self.server_port}\nOffline: {self.offline_mode}\nMembers: {len(self.online_users)}\nVoice users: {len(self.voice_users)}\nCached messages: {sum(len(v) for v in self.chat_history.values())}\nPython: {sys.version.split()[0]}")
+        refresh()
+        copy_btn=QPushButton("COPY CURRENT TARGET ID")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(str(self.current_target or "")))
+        layout.addWidget(copy_btn, alignment=Qt.AlignLeft)
+        buttons=QHBoxLayout(); apply_btn=QPushButton("APPLY")
+        def apply_dev():
+            self.developer_mode=enabled.isChecked(); self._save_feature_settings(); dialog.accept()
+        apply_btn.clicked.connect(apply_dev); buttons.addWidget(apply_btn); close=QPushButton("CLOSE"); close.clicked.connect(dialog.reject); buttons.addWidget(close); layout.addLayout(buttons); dialog.exec()
+
+    def open_plugin_manager(self):
+        for folder in (os.path.join(CONFIG_DIR,"plugins","client"), os.path.join(CONFIG_DIR,"plugins","server")):
+            os.makedirs(folder, exist_ok=True)
+        dialog=QDialog(self); dialog.setWindowTitle("NETRA // PLUGINS"); dialog.resize(700, 520); dialog.setStyleSheet(self.dialog_qss())
+        layout=QVBoxLayout(dialog); title=QLabel("PLUGIN MANAGER"); title.setProperty("role","title"); layout.addWidget(title)
+        tabs=QStackedWidget(); client=QWidget(); server=QWidget()
+        selector=QComboBox(); selector.addItems(["CLIENT PLUGINS", "SERVER PLUGINS"]); selector.currentIndexChanged.connect(tabs.setCurrentIndex); layout.addWidget(selector)
+        def make_page(kind, parent_widget):
+            l=QVBoxLayout(parent_widget); path=os.path.join(CONFIG_DIR,"plugins",kind); l.addWidget(QLabel(f"{kind.upper()} PLUGINS  //  {path}"))
+            listing=QListWidget(); l.addWidget(listing,1)
+            plugins=self.client_plugins if kind=="client" else self.server_plugins
+            for name, enabled in sorted(plugins.items()): listing.addItem(("[ON] " if enabled else "[OFF] ")+name)
+            scan=QPushButton("SCAN / REFRESH")
+            def do_scan():
+                plugins.clear()
+                for fn in sorted(os.listdir(path)):
+                    if fn.endswith((".py",".json")) and fn not in ("__init__.py",): plugins[fn]=bool(plugins.get(fn, False))
+                self._save_feature_settings(); listing.clear()
+                for name, enabled in sorted(plugins.items()): listing.addItem(("[ON] " if enabled else "[OFF] ")+name)
+            scan.clicked.connect(do_scan); l.addWidget(scan)
+            return parent_widget
+        tabs.addWidget(make_page("client",client)); tabs.addWidget(make_page("server",server)); layout.addWidget(tabs,1)
+        note=QLabel("Client plugins run locally. Server plugins are advertised/configured here and require matching server support."); note.setProperty("role","muted"); note.setWordWrap(True); layout.addWidget(note)
+        close=QPushButton("CLOSE"); close.clicked.connect(dialog.accept); layout.addWidget(close); dialog.exec()
+
+    def _request_music_state(self):
+        # Music is intentionally client-local.  Do not contact the NETRA server.
+        self._refresh_music_dialog()
+
+    def _music_command(self, action, value=None):
+        action = str(action).upper()
+        if action == "ADD" and value is not None:
+            self._local_music_add(str(value))
+        elif action == "REMOVE" and value is not None:
+            try:
+                row = int(value)
+                if 0 <= row < len(self.music_state.get("queue", [])):
+                    if row == self.music_state.get("index", 0) and self.music_listening:
+                        self._stop_local_music()
+                    self.music_state["queue"].pop(row)
+                    if self.music_state["queue"]:
+                        self.music_state["index"] = min(self.music_state.get("index", 0), len(self.music_state["queue"]) - 1)
+                    else:
+                        self.music_state.update({"index": 0, "current": None, "playing": False, "paused": False})
+                    self._refresh_music_dialog()
+            except Exception:
+                pass
+        elif action == "CLEAR":
+            self._stop_local_music()
+            self.music_state = {"queue": [], "index": 0, "current": None, "playing": False, "paused": False, "position": 0.0}
+            self._refresh_music_dialog()
+        elif action == "PLAY":
+            self._play_local_music()
+        elif action == "PAUSE":
+            self._pause_local_music()
+        elif action == "RESUME":
+            self._resume_local_music()
+        elif action == "STOP":
+            self._stop_local_music()
+        elif action == "SKIP" or action == "NEXT":
+            self._next_local_music()
+        elif action == "PREV":
+            self._previous_local_music()
+
+    def _local_ydl_opts(self, flat=False):
+        return {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": False,
+            "extract_flat": flat,
+            "skip_download": True,
+            "ignoreerrors": True,
+            "default_search": "ytsearch",
+            "source_address": "0.0.0.0",
+        }
+
+    def _local_music_add(self, query):
+        if not YTDLP_AVAILABLE:
+            self.show_error("Local YouTube playback requires yt-dlp. Install it with:\npython -m pip install -U yt-dlp")
+            return
+        self.music_status_label.setText("IMPORTING INTO LOCAL PLAYLIST...") if hasattr(self, "music_status_label") else None
+        threading.Thread(target=self._local_music_add_worker, args=(query,), daemon=True, name="NETRA-Local-Music-Import").start()
+
+    def _local_music_add_worker(self, query):
+        try:
+            with yt_dlp.YoutubeDL(self._local_ydl_opts(flat=True)) as ydl:
+                info = ydl.extract_info(query, download=False)
+            if not info:
+                raise RuntimeError("No playable result was found.")
+            entries = info.get("entries") if isinstance(info, dict) else None
+            if entries is None:
+                entries = [info]
+            added = []
+            for entry in entries:
+                if not entry:
+                    continue
+                item = {
+                    "title": entry.get("title") or entry.get("id") or "Unknown track",
+                    "webpage_url": entry.get("webpage_url") or entry.get("original_url") or entry.get("url"),
+                    "url": entry.get("webpage_url") or entry.get("original_url") or entry.get("url"),
+                    "id": entry.get("id"),
+                    "duration": entry.get("duration") or 0,
+                }
+                if item["url"]:
+                    added.append(item)
+            if not added:
+                raise RuntimeError("The playlist did not contain any playable tracks.")
+            self.music_state.setdefault("queue", []).extend(added)
+            if self.music_state.get("current") is None:
+                self.music_state["index"] = 0
+                self.music_state["current"] = self.music_state["queue"][0]
+                threading.Thread(target=self._prefetch_local_track, args=(self.music_state["queue"][0],), daemon=True, name="NETRA-Music-Prefetch").start()
+            self._refresh_music_dialog()
+            if hasattr(self, "music_status_label"):
+                self.music_status_label.setText(f"LOCAL PLAYLIST // ADDED {len(added)} TRACK{'S' if len(added) != 1 else ''}")
+        except Exception as exc:
+            self._music_import_error = str(exc)
+            try:
+                self.show_error(f"Could not import music: {exc}")
+            except Exception:
+                pass
+        finally:
+            self._refresh_music_dialog()
+
+    def _prefetch_local_track(self, item):
+        try:
+            if not isinstance(item, dict) or item.get("direct_url"):
+                return
+            query = item.get("webpage_url") or item.get("url")
+            if not query or not YTDLP_AVAILABLE:
+                return
+            with yt_dlp.YoutubeDL({**self._local_ydl_opts(flat=False), "noplaylist": True}) as ydl:
+                info = ydl.extract_info(query, download=False)
+            if not info:
+                return
+            formats = info.get("formats") or []
+            audio = [f for f in formats if f.get("url") and f.get("acodec") not in (None, "none")]
+            if audio:
+                audio.sort(key=lambda f: ((f.get("abr") or 0), (f.get("asr") or 0)), reverse=True)
+                direct = audio[0].get("url")
+            else:
+                direct = info.get("url")
+            if direct:
+                item["direct_url"] = direct
+                item["direct_url_time"] = time.time()
+        except Exception:
+            pass
+
+    def _local_track_stream(self, item):
+        if not YTDLP_AVAILABLE:
+            raise RuntimeError("yt-dlp is not installed.")
+        cached = item.get("direct_url") if isinstance(item, dict) else None
+        cached_at = float(item.get("direct_url_time", 0) or 0) if isinstance(item, dict) else 0.0
+        if cached and cached_at and time.time() - cached_at < 1500:
+            return cached, item
+        query = item.get("webpage_url") or item.get("url")
+        with yt_dlp.YoutubeDL({**self._local_ydl_opts(flat=False), "noplaylist": True}) as ydl:
+            info = ydl.extract_info(query, download=False)
+        if not info:
+            raise RuntimeError("Could not resolve this track.")
+        formats = info.get("formats") or []
+        audio = [f for f in formats if f.get("url") and (f.get("acodec") not in (None, "none"))]
+        if not audio:
+            direct = info.get("url")
+        else:
+            audio.sort(key=lambda f: ((f.get("abr") or 0), (f.get("asr") or 0)), reverse=True)
+            direct = audio[0].get("url")
+        if not direct:
+            raise RuntimeError("No direct audio stream was available for this track.")
+        if isinstance(item, dict):
+            item["direct_url"] = direct
+            item["direct_url_time"] = time.time()
+        return direct, info
+
+    def _play_local_music(self):
+        if not SOUNDDEVICE_AVAILABLE:
+            self.show_error("Local music playback requires sounddevice. Install it with:\npython -m pip install sounddevice")
+            return
+        if not AV_AVAILABLE:
+            self.show_error("Local music playback requires PyAV. Install it with:\npython -m pip install av")
+            return
+        q = self.music_state.get("queue", [])
+        if not q:
+            self.show_error("Your local music playlist is empty.")
+            return
+        self.music_state["playing"] = True
+        self.music_state["paused"] = False
+        if self.music_state.get("current") is None:
+            self.music_state["index"] = min(int(self.music_state.get("index", 0)), len(q)-1)
+            self.music_state["current"] = q[self.music_state["index"]]
+        self._start_local_music_worker()
+        self._refresh_music_dialog()
+
+    def _start_local_music_worker(self):
+        if getattr(self, "_local_music_thread", None) and self._local_music_thread.is_alive():
+            return
+        self._local_music_stop = False
+        self._local_music_thread = threading.Thread(target=self._local_music_worker, daemon=True, name="NETRA-Local-Music")
+        self._local_music_thread.start()
+
+    def _local_music_worker(self):
+        try:
+            while self.music_state.get("playing") and not getattr(self, "_local_music_stop", False):
+                q = self.music_state.get("queue", [])
+                idx = int(self.music_state.get("index", 0))
+                if not q or idx >= len(q):
+                    break
+                item = q[idx]
+                self.music_state["current"] = item
+                self.music_state["position"] = 0.0
+                direct, info = self._local_track_stream(item)
+                container = av.open(direct, mode="r", options={"reconnect": "1", "reconnect_streamed": "1", "reconnect_delay_max": "5"})
+                audio_stream = next((st for st in container.streams if st.type == "audio"), None)
+                if audio_stream is None:
+                    container.close(); raise RuntimeError("Track contains no audio stream.")
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=32000)
+                stream = None
+                try:
+                    for frame in container.decode(audio=audio_stream.index):
+                        if not self.music_state.get("playing") or getattr(self, "_local_music_stop", False):
+                            break
+                        while self.music_state.get("paused") and self.music_state.get("playing") and not getattr(self, "_local_music_stop", False):
+                            time.sleep(0.05)
+                        for out in resampler.resample(frame):
+                            pcm = out.to_ndarray().tobytes()
+                            if not pcm:
+                                continue
+                            if stream is None:
+                                stream = sd.RawOutputStream(samplerate=32000, channels=1, dtype="int16", device=getattr(self, "voice_output_device", None), blocksize=0)
+                                stream.start()
+                                self.music_output_stream = stream
+                            stream.write(pcm)
+                            self.music_state["position"] = float(frame.time or 0.0)
+                finally:
+                    if stream is not None:
+                        try: stream.stop(); stream.close()
+                        except Exception: pass
+                    if self.music_output_stream is stream:
+                        self.music_output_stream = None
+                    container.close()
+                if not self.music_state.get("playing") or getattr(self, "_local_music_stop", False):
+                    break
+                # Automatically advance to the next local track.
+                if idx + 1 < len(q):
+                    self.music_state["index"] = idx + 1
+                    self.music_state["current"] = q[idx + 1]
+                else:
+                    self.music_state["playing"] = False
+                    self.music_state["paused"] = False
+                    self.music_state["position"] = 0.0
+                    break
+        except Exception as exc:
+            self.music_state["playing"] = False
+            self.music_state["paused"] = False
+            self._local_music_error = str(exc)
+            QTimer.singleShot(0, lambda e=str(exc): self.show_error(f"NETRA local music playback failed: {e}"))
+        finally:
+            self.music_output_stream = None
+            QTimer.singleShot(0, self._refresh_music_dialog)
+
+    def _pause_local_music(self):
+        if self.music_state.get("playing"):
+            self.music_state["paused"] = True
+            self._refresh_music_dialog()
+
+    def _resume_local_music(self):
+        if self.music_state.get("playing"):
+            self.music_state["paused"] = False
+            self._refresh_music_dialog()
+        else:
+            self._play_local_music()
+
+    def _stop_local_music(self):
+        self._local_music_stop = True
+        self.music_state["playing"] = False
+        self.music_state["paused"] = False
+        try:
+            if self.music_output_stream is not None:
+                self.music_output_stream.stop(); self.music_output_stream.close()
+        except Exception:
+            pass
+        self.music_output_stream = None
+        self._refresh_music_dialog()
+
+    def _next_local_music(self):
+        q = self.music_state.get("queue", [])
+        if not q:
+            return
+        idx = min(int(self.music_state.get("index", 0)) + 1, len(q)-1)
+        self.music_state["index"] = idx
+        self.music_state["current"] = q[idx]
+        self.music_state["position"] = 0.0
+        self.music_state["playing"] = True
+        self.music_state["paused"] = False
+        self._local_music_stop = True
+        time.sleep(0.03)
+        self._local_music_stop = False
+        self._start_local_music_worker()
+        self._refresh_music_dialog()
+
+    def _previous_local_music(self):
+        q = self.music_state.get("queue", [])
+        if not q:
+            return
+        idx = max(int(self.music_state.get("index", 0)) - 1, 0)
+        self.music_state["index"] = idx
+        self.music_state["current"] = q[idx]
+        self.music_state["position"] = 0.0
+        self.music_state["playing"] = True
+        self.music_state["paused"] = False
+        self._local_music_stop = True
+        time.sleep(0.03)
+        self._local_music_stop = False
+        self._start_local_music_worker()
+        self._refresh_music_dialog()
+
+    def _select_local_music_row(self, item):
+        try:
+            row = self.music_queue_list.row(item)
+            q = self.music_state.get("queue", [])
+            if row < 0 or row >= len(q):
+                return
+            self._stop_local_music()
+            self.music_state["index"] = row
+            self.music_state["current"] = q[row]
+            self.music_state["position"] = 0.0
+            self.music_state["playing"] = True
+            self.music_state["paused"] = False
+            self.music_listening = True
+            self._play_local_music()
+            self._refresh_music_dialog()
+        except Exception as exc:
+            self.show_error(f"Could not start that track: {exc}")
+
+    def open_music_player(self):
+        if self.music_dialog is not None:
+            try:
+                self.music_dialog.raise_()
+                self.music_dialog.activateWindow()
+                return
+            except Exception:
+                self.music_dialog = None
+
+        dialog = QDialog(self)
+        self.music_dialog = dialog
+        dialog.setWindowTitle("NETRA // MUSIC / PLAYLIST")
+        dialog.setMinimumSize(560, 500)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+
+        title = QLabel("MUSIC // LOCAL PLAYER")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        status = QLabel("Private playback — only you hear this music. It does not use or update the NETRA server.")
+        status.setProperty("role", "muted")
+        status.setWordWrap(True)
+        layout.addWidget(status)
+        self.music_status_label = status
+
+        listen_btn = QPushButton("STOP MUSIC" if self.music_listening else "LISTEN IN NETRA")
+        listen_btn.clicked.connect(self._toggle_music_listener)
+        layout.addWidget(listen_btn)
+        self.music_listen_button = listen_btn
+
+        add_row = QHBoxLayout()
+        self.music_query_entry = QLineEdit()
+        self.music_query_entry.setPlaceholderText("YouTube / YouTube Music URL, playlist URL, or search text")
+        add_row.addWidget(self.music_query_entry, 1)
+        add_btn = QPushButton("IMPORT")
+        add_btn.clicked.connect(self._music_add_from_dialog)
+        add_row.addWidget(add_btn)
+        layout.addLayout(add_row)
+        self.music_query_entry.returnPressed.connect(self._music_add_from_dialog)
+
+        self.music_queue_list = QListWidget()
+        self.music_queue_list.itemClicked.connect(lambda item: self._music_play_selected(self.music_queue_list.row(item)))
+        layout.addWidget(self.music_queue_list, 1)
+
+        controls = QHBoxLayout()
+        for label, action in [("PREV", "PREV"), ("PLAY", "PLAY"), ("PAUSE", "PAUSE"), ("RESUME", "RESUME"), ("SKIP", "SKIP"), ("STOP", "STOP")]:
+            button = QPushButton(label)
+            button.clicked.connect(lambda checked=False, a=action: self._music_command(a))
+            controls.addWidget(button)
+        layout.addLayout(controls)
+
+        remove_row = QHBoxLayout()
+        remove_btn = QPushButton("REMOVE SELECTED")
+        remove_btn.clicked.connect(self._music_remove_selected)
+        remove_row.addWidget(remove_btn)
+        clear_btn = QPushButton("CLEAR PLAYLIST")
+        clear_btn.clicked.connect(lambda: self._music_command("CLEAR"))
+        remove_row.addWidget(clear_btn)
+        remove_row.addStretch(1)
+        layout.addLayout(remove_row)
+
+        close_btn = QPushButton("CLOSE")
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+
+        dialog.finished.connect(lambda _: setattr(self, "music_dialog", None))
+        self._refresh_music_dialog()
+        dialog.show()
+
+    def _music_add_from_dialog(self):
+        entry = getattr(self, "music_query_entry", None)
+        if entry is None:
+            return
+        query = entry.text().strip()
+        if not query:
+            return
+        entry.clear()
+        self._music_command("ADD", query)
+
+    def _music_remove_selected(self):
+        widget = getattr(self, "music_queue_list", None)
+        if widget is None:
+            return
+        row = widget.currentRow()
+        if row >= 0:
+            self._music_command("REMOVE", row)
+
+    def _music_play_selected(self, row):
+        try:
+            row = int(row)
+        except Exception:
+            return
+        q = self.music_state.get("queue", []) or []
+        if row < 0 or row >= len(q):
+            return
+        self._local_music_stop = True
+        self.music_state["index"] = row
+        self.music_state["current"] = q[row]
+        self.music_state["position"] = 0.0
+        self.music_state["playing"] = True
+        self.music_state["paused"] = False
+        self.music_listening = True
+        try:
+            if self.music_output_stream is not None:
+                self.music_output_stream.stop(); self.music_output_stream.close()
+        except Exception:
+            pass
+        self.music_output_stream = None
+        self._local_music_stop = False
+        self._start_local_music_worker()
+        self._refresh_music_dialog()
+
+    def _refresh_music_dialog(self):
+        widget = getattr(self, "music_queue_list", None)
+        if widget is None:
+            return
+        state = self.music_state if isinstance(self.music_state, dict) else {}
+        queue_items = state.get("queue") or []
+        current_index = int(state.get("index", 0) or 0)
+        widget.clear()
+        for idx, item in enumerate(queue_items):
+            title = str((item or {}).get("title") or (item or {}).get("url") or "Unknown track")
+            prefix = "▶ " if idx == current_index and state.get("playing") else "   "
+            widget.addItem(f"{prefix}{idx + 1}. {title}")
+        current = state.get("current") or {}
+        title = current.get("title") if isinstance(current, dict) else None
+        listen_button = getattr(self, "music_listen_button", None)
+        if listen_button is not None:
+            listen_button.setText("STOP LISTENING" if self.music_listening else "LISTEN IN NETRA")
+        if title:
+            mode = "PAUSED" if state.get("paused") else "PLAYING" if state.get("playing") else "STOPPED"
+            position = float(state.get("position", 0) or 0)
+            listen = " // LOCAL AUDIO ON" if self.music_listening else ""
+            self.music_status_label.setText(f"{mode} // {title} // {position:.1f}s{listen}")
+        else:
+            listen = " // LOCAL AUDIO ON" if self.music_listening else ""
+            self.music_status_label.setText("Playlist empty // add a YouTube URL or search text" + listen)
+
+    def open_vc_room(self):
+        """Open the inline VC workspace instead of creating a second window."""
+        if not self.in_voice_chat:
+            self.show_error("Join a voice channel first.")
+            return
+        if not self.voice_hud_expanded:
+            self.toggle_voice_hud_expand()
+        else:
+            self._update_voice_hud_expanded()
+
+    def _vc_room_user_menu(self, pos):
+        item = self.vc_room_users_list.itemAt(pos) if self.vc_room_users_list is not None else None
+        if item is None:
+            return
+        text = item.text().split("   ", 1)[0].replace("🟢 ", "").replace("⚪ ", "").strip()
+        menu = QMenu(self)
+        copy_action = menu.addAction("COPY USERNAME")
+        menu.addSeparator()
+        mute_action = menu.addAction("MUTE USER" if not self.voice_user_mutes.get(text, False) else "UNMUTE USER")
+        chosen = menu.exec(self.vc_room_users_list.mapToGlobal(pos))
+        if chosen == copy_action:
+            QApplication.clipboard().setText(text)
+        elif chosen == mute_action and text != self.username:
+            self.voice_user_mutes[text] = not self.voice_user_mutes.get(text, False)
+            self._save_feature_settings()
+            self._refresh_vc_room()
+
+    def _refresh_vc_room(self):
+        window = getattr(self, "vc_room_window", None)
+        if window is None or not window.isVisible():
+            return
+        users = list(dict.fromkeys(self.voice_users or [self.username])) if self.in_voice_chat else []
+        if getattr(self, "vc_room_count", None) is not None:
+            self.vc_room_count.setText(f"{len(users)} IN VC")
+        if self.vc_room_users_list is not None:
+            self.vc_room_users_list.clear()
+            for user in users:
+                state = self.voice_wave_state.get(user, {})
+                level = float(state.get("level", 0.0))
+                speaking = level > 0.035
+                wave_chars = "▁▂▃▄▅▆▇█"
+                idx = min(len(wave_chars) - 1, max(0, int(level * len(wave_chars))))
+                wave = wave_chars[idx] * 7 if speaking else "▁▁▁▁▁▁▁"
+                muted = bool(self.voice_user_mutes.get(user, False)) if user != self.username else self.voice_muted
+                state_text = "MUTED" if muted else ("SPEAKING" if speaking else "LISTENING")
+                self.vc_room_users_list.addItem(f"{'🟢' if speaking else '⚪'} {user}   {state_text}\n   {wave}")
+        if getattr(self, "vc_room_share_label", None) is not None and self.screen_sharing and self.screen_share_last_frame is not None:
+            pix = self.pil_to_pixmap(self.screen_share_last_frame, (self.vc_room_share_label.width() - 20, self.vc_room_share_label.height() - 20))
+            self.vc_room_share_label.setPixmap(pix)
+            self.vc_room_share_label.setText("")
+        elif getattr(self, "vc_room_share_label", None) is not None and not self.screen_sharing:
+            self.vc_room_share_label.setPixmap(QPixmap())
+            self.vc_room_share_label.setText("SCREEN SHARE\nNobody is sharing yet.")
+
+    def _windows_monitor_list(self):
+        """Return real Windows displays using Qt's screen enumeration.
+        This is more reliable than mixing Win32 logical coordinates with
+        PIL coordinates, especially on multi-monitor/high-DPI setups.
+        """
+        monitors = []
+        try:
+            screens = QApplication.screens()
+            primary = QApplication.primaryScreen()
+            for i, screen in enumerate(screens):
+                geo = screen.geometry()
+                monitors.append({
+                    "index": i,
+                    "screen": screen,
+                    "name": screen.name() or f"Display {i + 1}",
+                    "left": int(geo.left()), "top": int(geo.top()),
+                    "right": int(geo.right() + 1), "bottom": int(geo.bottom() + 1),
+                    "width": int(geo.width()), "height": int(geo.height()),
+                    "primary": screen is primary,
+                })
+        except Exception:
+            monitors = []
+        return monitors
+
+    def _selected_screen_capture_bounds(self, source_label):
+        if source_label and source_label.startswith("Virtual Desktop"):
+            monitors = self._windows_monitor_list()
+            if not monitors:
+                return None
+            left = min(m["left"] for m in monitors); top = min(m["top"] for m in monitors)
+            right = max(m["right"] for m in monitors); bottom = max(m["bottom"] for m in monitors)
+            return {"left": left, "top": top, "width": right - left, "height": bottom - top}
+        for label, rect in self._screen_capture_sources():
+            if label == source_label and rect:
+                return {"left": rect["left"], "top": rect["top"], "width": rect["width"], "height": rect["height"]}
+        return None
+
+    def _screen_capture_sources(self):
+        sources = [("Virtual Desktop — ALL MONITORS", None)]
+        for i, rect in enumerate(self._windows_monitor_list(), 1):
+            primary = " • PRIMARY" if rect["primary"] else ""
+            label = f"Monitor {i} — {rect['name']} — {rect['width']}×{rect['height']}{primary}"
+            sources.append((label, rect))
+        return sources
+
+    def _qimage_to_pil(self, qimage):
+        image = qimage.convertToFormat(QImage.Format_RGBA8888)
+        w, h = image.width(), image.height()
+        ptr = image.bits()
+        data = bytes(ptr)
+        return Image.frombuffer("RGBA", (w, h), data, "raw", "RGBA", 0, 1).convert("RGB")
+
+    def _screen_capture_loop(self):
+        """Capture desktop frames using a Windows GPU-friendly backend.
+
+        DXCam/DXGI is preferred on Windows because it avoids the expensive
+        full-screen PIL conversion that made 30/60 FPS capture hitch the UI.
+        MSS is retained as a fallback. Only the newest frame is ever kept.
+        """
+        dx = None
+        grabber = None
+        try:
+            bounds = self.screen_capture_source_bounds or {
+                "left": 0, "top": 0, "width": 1280, "height": 720
+            }
+            target_fps = max(1, int(self.screen_share_fps or 30))
+
+            # Prefer DXGI/DXCam on Windows. It captures the desktop through
+            # the graphics stack instead of repeatedly copying a PIL image.
+            if DXCAM_AVAILABLE and CV2_AVAILABLE and os.name == "nt":
+                dx = dxcam.create(output_idx=0, output_color="BGR")
+                region = (
+                    int(bounds["left"]),
+                    int(bounds["top"]),
+                    int(bounds["left"] + bounds["width"]),
+                    int(bounds["top"] + bounds["height"]),
+                )
+                dx.start(region=region, target_fps=target_fps, video_mode=True)
+                while self.screen_sharing and not self.screen_capture_stop.is_set():
+                    frame = dx.get_latest_frame()
+                    if frame is not None:
+                        # DXCam returns a numpy BGR array. Keep it as-is here;
+                        # conversion to a small preview happens only when Qt
+                        # actually needs to paint a new frame.
+                        with self.screen_capture_lock:
+                            self.screen_capture_pending = frame
+                    self.screen_capture_stop.wait(0.001)
+                return
+
+            if MSS_AVAILABLE:
+                grabber = mss.mss()
+
+            while self.screen_sharing and not self.screen_capture_stop.is_set():
+                started = time.monotonic()
+                if grabber is not None:
+                    raw = grabber.grab({
+                        "left": int(bounds["left"]),
+                        "top": int(bounds["top"]),
+                        "width": int(bounds["width"]),
+                        "height": int(bounds["height"]),
+                    })
+                    # Delay PIL conversion until the GUI actually consumes a
+                    # frame. This fallback still avoids building a frame queue.
+                    frame = raw
+                else:
+                    frame = ImageGrab.grab(
+                        bbox=(int(bounds["left"]), int(bounds["top"]),
+                              int(bounds["left"] + bounds["width"]),
+                              int(bounds["top"] + bounds["height"])),
+                        all_screens=True,
+                    )
+                with self.screen_capture_lock:
+                    self.screen_capture_pending = frame
+                delay = max(0.001, (1.0 / target_fps) - (time.monotonic() - started))
+                self.screen_capture_stop.wait(delay)
+        except Exception as exc:
+            self._screen_capture_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                if dx is not None:
+                    dx.stop()
+                    dx.release()
+            except Exception:
+                pass
+            try:
+                if grabber is not None:
+                    grabber.close()
+            except Exception:
+                pass
+
+
+    def _capture_screen_frame(self):
+        """Display only the newest worker-produced frame on the GUI thread."""
+        if not self.screen_sharing:
+            return
+        err = getattr(self, "_screen_capture_error", None)
+        if err:
+            self.screen_sharing = False
+            self._stop_screen_share_capture()
+            if getattr(self, "screen_share_status", None) is not None:
+                self.screen_share_status.setText(f"Capture error: {err}")
+            return
+        frame = None
+        with self.screen_capture_lock:
+            if self.screen_capture_pending is not None:
+                frame = self.screen_capture_pending
+                self.screen_capture_pending = None
+        if frame is not None:
+            now = time.monotonic()
+            if now - self.screen_capture_last_preview >= (1.0 / self.screen_capture_preview_fps):
+                self.screen_capture_last_preview = now
+                try:
+                    # Convert only the newest frame, and immediately scale it
+                    # to the preview size. No full-size PIL resize per frame.
+                    if hasattr(frame, "shape") and hasattr(frame, "tobytes"):
+                        h, w = int(frame.shape[0]), int(frame.shape[1])
+                        qimg = QImage(frame.data, w, h, int(frame.strides[0]), QImage.Format_BGR888).copy()
+                        pix = QPixmap.fromImage(qimg).scaled(640, 360, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    elif hasattr(frame, "bgra"):
+                        qimg = QImage(frame.bgra, frame.width, frame.height, frame.width * 4, QImage.Format_ARGB32).copy()
+                        pix = QPixmap.fromImage(qimg).scaled(640, 360, Qt.KeepAspectRatio, Qt.FastTransformation)
+                    else:
+                        if not isinstance(frame, Image.Image):
+                            frame = Image.frombytes("RGB", frame.size, frame.rgb)
+                        pix = self.pil_to_pixmap(frame, (640, 360))
+                    if self.screen_share_preview_label is not None:
+                        self.screen_share_preview_label.setPixmap(pix)
+                except Exception as exc:
+                    self._screen_capture_error = f"Preview error: {type(exc).__name__}: {exc}"
+                self._update_voice_hud_expanded()
+            # Keep the latest object available for future server transport.
+            self.screen_share_last_frame = frame
+
+    def _screen_monitor_images(self):
+        images = []
+        for m in self._windows_monitor_list():
+            try:
+                images.append(m["screen"].grabWindow(0).toImage())
+            except Exception:
+                pass
+        return images
+
+    def open_screen_share(self):
+        if not self.in_voice_chat:
+            self.show_error("Join a voice channel before starting screen share.")
+            return
+        if self.screen_share_dialog is not None and self.screen_share_dialog.isVisible():
+            self.screen_share_dialog.raise_(); self.screen_share_dialog.activateWindow(); return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // SCREEN SHARE")
+        dialog.setMinimumSize(620, 520)
+        dialog.resize(720, 600)
+        dialog.setStyleSheet(self.dialog_qss())
+        self.screen_share_dialog = dialog
+        layout = QVBoxLayout(dialog)
+        title = QLabel("🖥 SCREEN SHARE")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        status = QLabel("Screen sharing is stopped.")
+        status.setProperty("role", "muted")
+        self.screen_share_status = status
+        layout.addWidget(status)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("SHARE THIS DISPLAY"))
+        source = QComboBox()
+        source_labels = [label for label, _rect in self._screen_capture_sources()]
+        source.addItems(source_labels)
+        saved_source = self.screen_share_source
+        if saved_source in source_labels:
+            source.setCurrentText(saved_source)
+        row.addWidget(source, 1)
+        row.addWidget(QLabel("QUALITY"))
+        quality = QComboBox(); quality.addItems(["Low", "Balanced", "High", "Ultra"]); quality.setCurrentText(self.screen_share_quality)
+        row.addWidget(quality)
+        fps = QComboBox(); fps.addItems(["20 FPS", "30 FPS", "60 FPS"]); fps.setCurrentText(f"{self.screen_share_fps} FPS")
+        if fps.currentIndex() < 0:
+            fps.setCurrentText("30 FPS")
+        row.addWidget(fps)
+        layout.addLayout(row)
+        self.screen_share_source_combo = source
+
+        options = QHBoxLayout()
+        cursor_box = QCheckBox("Capture cursor")
+        cursor_box.setChecked(self.screen_share_cursor)
+        options.addWidget(cursor_box)
+        options.addWidget(QLabel("Tip: choose a monitor above to share only that display."))
+        options.addStretch(1)
+        layout.addLayout(options)
+
+        preview = QLabel("SCREEN PREVIEW\nPress START to capture your desktop.")
+        preview.setAlignment(Qt.AlignCenter)
+        preview.setMinimumHeight(320)
+        preview.setStyleSheet("border: 1px solid rgba(255,255,255,35); background: rgba(0,0,0,90); border-radius: 8px;")
+        self.screen_share_preview_label = preview
+        layout.addWidget(preview, 1)
+        backend_note = "DXCam / DXGI + OpenCV" if (DXCAM_AVAILABLE and CV2_AVAILABLE and os.name == "nt") else ("MSS fallback (install OpenCV to enable DXCam / DXGI)" if MSS_AVAILABLE else "Windows desktop capture fallback")
+        info = QLabel(f"Capture backend: {backend_note}. Remote viewers require a future server-side screen-share relay; this client does not pretend the current server supports it.")
+        info.setWordWrap(True); info.setProperty("role", "muted")
+        layout.addWidget(info)
+
+        controls = QHBoxLayout()
+        start = QPushButton("STOP SCREEN SHARE" if self.screen_sharing else "START SCREEN SHARE")
+        controls.addWidget(start)
+        expand_vc = QPushButton("EXPAND VC")
+        expand_vc.clicked.connect(self.open_vc_room)
+        controls.addWidget(expand_vc)
+        controls.addStretch(1)
+        close = QPushButton("CLOSE"); close.clicked.connect(dialog.accept); controls.addWidget(close)
+        layout.addLayout(controls)
+
+        def toggle():
+            self.screen_share_quality = quality.currentText()
+            self.screen_share_fps = int(fps.currentText().split()[0])
+            self.screen_share_cursor = bool(cursor_box.isChecked())
+            self.screen_share_source = source.currentText()
+            self._save_feature_settings()
+            self.screen_sharing = not self.screen_sharing
+            if self.screen_sharing:
+                status.setText("Screen sharing ACTIVE — capturing locally.")
+                start.setText("STOP SCREEN SHARE")
+                self.screen_share_last_frame = None
+                self._screen_capture_error = None
+                self.screen_capture_stop.clear()
+                self.screen_capture_source_bounds = self._selected_screen_capture_bounds(self.screen_share_source)
+                if self.screen_share_timer is None:
+                    self.screen_share_timer = QTimer(self)
+                    self.screen_share_timer.timeout.connect(self._capture_screen_frame)
+                # Preview rendering is capped at 30 FPS; capture itself still runs at 20/30/60.
+                self.screen_share_timer.start(33)
+                self.screen_capture_thread = threading.Thread(target=self._screen_capture_loop, name="NETRA-ScreenCapture", daemon=True)
+                self.screen_capture_thread.start()
+                # Kept for future server support; the current server ignores this message.
+                self._network_send("SCREENSHARE:START:" + self.screen_share_quality, queue_offline=False)
+            else:
+                self._stop_screen_share_capture()
+                status.setText("Screen sharing is stopped.")
+                start.setText("START SCREEN SHARE")
+                self._network_send("SCREENSHARE:STOP:" + self.screen_share_quality, queue_offline=False)
+            self._refresh_vc_room()
+
+        source.currentTextChanged.connect(lambda value: (setattr(self, "screen_share_source", value), setattr(self, "screen_capture_source_bounds", self._selected_screen_capture_bounds(value))))
+        quality.currentTextChanged.connect(lambda value: setattr(self, "screen_share_quality", value))
+        fps.currentTextChanged.connect(lambda value: setattr(self, "screen_share_fps", int(value.split()[0])))
+        cursor_box.toggled.connect(lambda value: setattr(self, "screen_share_cursor", bool(value)))
+        start.clicked.connect(toggle)
+        dialog.finished.connect(lambda _=0: setattr(self, "screen_share_dialog", None))
+        if self.screen_sharing:
+            status.setText("Screen sharing ACTIVE — capturing locally.")
+            start.setText("STOP SCREEN SHARE")
+            self._screen_capture_error = None
+            self.screen_capture_stop.clear()
+            self.screen_capture_source_bounds = self._selected_screen_capture_bounds(self.screen_share_source)
+            if self.screen_share_timer is None:
+                self.screen_share_timer = QTimer(self); self.screen_share_timer.timeout.connect(self._capture_screen_frame)
+            self.screen_share_timer.start(33)
+            self.screen_capture_thread = threading.Thread(target=self._screen_capture_loop, name="NETRA-ScreenCapture", daemon=True)
+            self.screen_capture_thread.start()
+        dialog.show()
+
+    def _stop_screen_share_capture(self):
+        self.screen_sharing = False
+        self.screen_capture_stop.set()
+        if self.screen_share_timer is not None:
+            self.screen_share_timer.stop()
+        with self.screen_capture_lock:
+            self.screen_capture_pending = None
+        self.screen_share_last_frame = None
+        self.screen_capture_preview_fps = 15
+        self.screen_capture_last_preview = 0.0
+        self.screen_capture_source_bounds = None
+        self._screen_capture_error = None
+        self.screen_capture_thread = None
+        if self.screen_share_preview_label is not None:
+            self.screen_share_preview_label.setPixmap(QPixmap())
+            self.screen_share_preview_label.setText("SCREEN PREVIEW\nPress START to capture your desktop.")
+        self._update_voice_hud_expanded()
+
+    def open_floating_voice_window(self):
+        """Legacy name retained; VC now expands inline instead of opening a pop-out."""
+        if self.in_voice_chat:
+            if not self.voice_hud_expanded:
+                self.toggle_voice_hud_expand()
+            else:
+                self.toggle_voice_hud_expand()
 
     def _manual_connect(self):
+        host = self.server_ip_entry.text().strip() if hasattr(self, "server_ip_entry") else self.server_host
+        if not host:
+            self.server_status_label.setText("enter a server address")
+            return
+        self.server_host = host
+        self.settings["server_host"] = host
+        save_settings(self.settings)
         if self._last_password:
             self.connect_and_auth(self._last_auth_mode or "LOGIN", self.username, self._last_password)
         else:
@@ -1365,6 +3118,162 @@ class FullDiscordClone(QMainWindow):
         self.auth_dialog = AuthDialog(self, self.username)
         self.auth_dialog.authenticated.connect(self.connect_and_auth)
         self.auth_dialog.exec()
+
+    def _log_debug(self, message):
+        entry = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {message}"
+        self.debug_log.append(entry)
+        self.debug_log = self.debug_log[-1000:]
+        try:
+            self.settings["debug_log"] = self.debug_log[-1000:]
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def _apply_ui_scale_setting(self, text):
+        try:
+            value = int(str(text).replace("%", ""))
+        except Exception:
+            value = 100
+        self.ui_scale = max(80, min(150, value))
+        self.settings["ui_scale"] = self.ui_scale
+        save_settings(self.settings)
+        # Qt's global font scaling is safe to apply without rebuilding widgets.
+        app = QApplication.instance()
+        if app:
+            font = app.font()
+            base = 9.0
+            font.setPointSizeF(base * self.ui_scale / 100.0)
+            app.setFont(font)
+
+    def export_settings(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export NETRA settings", "netra-settings.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            data = dict(self.settings)
+            data.pop("debug_log", None)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+            self.settings_status.setText("✓ SETTINGS EXPORTED")
+        except Exception as exc:
+            self.show_error(f"Could not export settings: {exc}")
+
+    def import_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import NETRA settings", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                raise ValueError("Settings file is not a JSON object.")
+            # Keep credentials/session data out of imported preferences.
+            for key in ("debug_log", "account_id"):
+                data.pop(key, None)
+            self.settings.update(data)
+            save_settings(self.settings)
+            self.show_info("Settings imported. NETRA will use the imported preferences; restart if a global UI setting needs a full refresh.")
+        except Exception as exc:
+            self.show_error(f"Could not import settings: {exc}")
+
+    def reset_ui_preferences(self):
+        if QMessageBox.question(self, "Reset UI", "Reset theme, density, font size, accent and UI scale?") != QMessageBox.Yes:
+            return
+        self.customization = {"accent": "", "font_size": 12, "density": "Comfortable"}
+        self.ui_scale = 100
+        self.settings["customization"] = dict(self.customization)
+        self.settings["ui_scale"] = 100
+        save_settings(self.settings)
+        self.theme_name = "NETRA Terminal"
+        self.settings["theme"] = self.theme_name
+        self._apply_theme()
+        if hasattr(self, "ui_scale_combo"):
+            self.ui_scale_combo.setCurrentText("100%")
+
+    def reset_all_settings(self):
+        if QMessageBox.question(self, "Reset Settings", "Reset NETRA preferences to defaults? This keeps chat cache and downloaded files.") != QMessageBox.Yes:
+            return
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                os.remove(SETTINGS_FILE)
+            self.settings = load_settings()
+            self.show_info("Settings reset. Restart NETRA for a completely clean client session.")
+        except Exception as exc:
+            self.show_error(f"Could not reset settings: {exc}")
+
+    def open_debug_log(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // DEBUG LOG")
+        dialog.resize(820, 520)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        view = QListWidget()
+        view.addItems(self.debug_log[-1000:] or ["No debug entries yet."])
+        layout.addWidget(view, 1)
+        row = QHBoxLayout()
+        clear = QPushButton("CLEAR")
+        def clear_log():
+            self.debug_log.clear(); self.settings["debug_log"] = []; save_settings(self.settings); view.clear()
+        clear.clicked.connect(clear_log); row.addWidget(clear)
+        close = QPushButton("CLOSE"); close.clicked.connect(dialog.accept); row.addWidget(close)
+        layout.addLayout(row)
+        dialog.exec()
+
+    def show_info(self, message):
+        QMessageBox.information(self, "NETRA", message)
+
+    def open_emoji_picker(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // EMOJI")
+        dialog.setFixedSize(420, 300)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        search = QLineEdit(); search.setPlaceholderText("Filter emoji…"); layout.addWidget(search)
+        grid = QGridLayout(); layout.addLayout(grid)
+        emojis = ["😀","😂","🤣","😊","😍","😎","🤔","😮","😢","😭","😡","👍","👎","❤️","🔥","🎉","👀","💀","✨","💯","🙏","🤝","👏","🚀","🎵","🎮","🖼️","⚡","✅","❌","⭐","😴","🤖","🫡","🗿"]
+        buttons = []
+        def rebuild():
+            while grid.count():
+                item = grid.takeAt(0); w=item.widget()
+                if w: w.deleteLater()
+            q=search.text().strip()
+            shown=emojis if not q else [e for e in emojis if q in e]
+            for i,e in enumerate(shown):
+                b=QPushButton(e); b.setFixedSize(48,38); b.clicked.connect(lambda _, x=e: self._insert_emoji(x, dialog)); grid.addWidget(b,i//7,i%7)
+        search.textChanged.connect(rebuild); rebuild()
+        close=QPushButton("CLOSE"); close.clicked.connect(dialog.reject); layout.addWidget(close)
+        dialog.exec()
+
+    def _insert_emoji(self, emoji, dialog=None):
+        self.message_entry.insert(emoji)
+        self.message_entry.setFocus()
+        if dialog: dialog.accept()
+
+    def open_image_viewer(self, path):
+        try:
+            pix = QPixmap(path)
+            if pix.isNull():
+                self._open_local_file(path); return
+            dialog = QDialog(self); dialog.setWindowTitle(f"NETRA // IMAGE // {os.path.basename(path)}"); dialog.resize(900, 700); dialog.setStyleSheet(self.dialog_qss())
+            layout=QVBoxLayout(dialog); scroll=QScrollArea(); scroll.setWidgetResizable(True)
+            label=QLabel(); label.setAlignment(Qt.AlignCenter); label.setPixmap(pix.scaled(840, 620, Qt.KeepAspectRatio, Qt.SmoothTransformation)); scroll.setWidget(label); layout.addWidget(scroll,1)
+            controls = QHBoxLayout()
+            copy_btn = QPushButton("COPY IMAGE")
+            def copy_image():
+                QApplication.clipboard().setPixmap(pix)
+                self.chat_status_label.setText("image copied")
+            copy_btn.clicked.connect(copy_image); controls.addWidget(copy_btn)
+            save_btn = QPushButton("SAVE AS")
+            def save_image():
+                dest, _ = QFileDialog.getSaveFileName(dialog, "Save Image", os.path.basename(path), "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+                if dest:
+                    pix.save(dest)
+            save_btn.clicked.connect(save_image); controls.addWidget(save_btn)
+            controls.addStretch(1)
+            close=QPushButton("CLOSE"); close.clicked.connect(dialog.accept); controls.addWidget(close)
+            layout.addLayout(controls); dialog.exec()
+        except Exception as exc:
+            self.show_error(f"Could not display image: {exc}")
 
     def open_settings(self):
         self.settings_overlay.setGeometry(self.rect())
@@ -1479,6 +3388,12 @@ class FullDiscordClone(QMainWindow):
             "dm_sound_path": self.settings.get("dm_sound_path", ""),
             "voice_input_device": self._audio_selection_to_index(self.input_device_combo.currentText()),
             "voice_output_device": self._audio_selection_to_index(self.output_device_combo.currentText()),
+            "remember_username": self.remember_username,
+            "auto_open_images": self.auto_open_images,
+            "desktop_notifications": self.desktop_notifications,
+            "notification_sound_enabled": self.notification_sound_enabled,
+            "ui_scale": self.ui_scale,
+            "ptt_key": self.ptt_key,
             "voice_profile": self.voice_profile_combo.currentText() if hasattr(self, "voice_profile_combo") else self.settings.get("voice_profile", "Recording"),
             "voice_volume": self.voice_volume,
             "voice_mic_gain": self.voice_mic_gain,
@@ -1492,7 +3407,7 @@ class FullDiscordClone(QMainWindow):
             "voice_user_volumes": self.voice_user_volumes,
             "voice_user_mutes": self.voice_user_mutes,
         })
-        save_settings(self.settings)
+        self._save_feature_settings()
         self.settings_status.setText("✓ SETTINGS SAVED")
         self._refresh_voice_user_settings()
 
@@ -1512,6 +3427,245 @@ class FullDiscordClone(QMainWindow):
         else:
             self.showFullScreen()
 
+    def _ptt_key_pressed(self, key):
+        return {"Control": Qt.Key_Control, "Shift": Qt.Key_Shift, "Alt": Qt.Key_Alt, "Space": Qt.Key_Space}.get(self.ptt_key, Qt.Key_Control) == key
+
+    def _save_drafts(self):
+        try:
+            self.settings["drafts"] = dict(self.drafts)
+            self.settings["recent_targets"] = list(self.recent_targets)[-20:]
+            self.settings["dnd_mode"] = bool(self.dnd_mode)
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def _save_current_draft(self):
+        try:
+            target = str(self.current_target or "")
+            if not target or not hasattr(self, "message_entry"):
+                return
+            value = self.message_entry.text()
+            if value:
+                self.drafts[target] = value
+            else:
+                self.drafts.pop(target, None)
+            self._save_drafts()
+        except Exception:
+            pass
+
+    def _restore_draft(self, target):
+        try:
+            value = str(self.drafts.get(str(target), ""))
+            if hasattr(self, "message_entry"):
+                self.message_entry.setText(value)
+        except Exception:
+            pass
+
+    def open_command_palette(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // COMMAND PALETTE")
+        dialog.resize(700, 560)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        query = QLineEdit()
+        query.setPlaceholderText("Type a command or search…")
+        layout.addWidget(query)
+        results = QListWidget()
+        layout.addWidget(results, 1)
+
+        commands = [
+            ("Search messages", self.global_search),
+            ("Open notifications", self.open_notification_center),
+            ("Open settings", self.open_settings),
+            ("Open music player", self.open_music_player),
+            ("Open connection diagnostics", self.open_connection_diagnostics),
+            ("Open files gallery", self.open_files_gallery),
+            ("Open emoji picker", self.open_emoji_picker),
+            ("Open VC", self.open_vc_room),
+            ("Screen share", self.open_screen_share),
+            ("Toggle fullscreen", self.toggle_fullscreen),
+            ("Toggle DND", self.toggle_dnd_mode),
+            ("Clear image cache", self.flush_image_cache),
+            ("Reset UI preferences", self.reset_ui_preferences),
+            ("Export settings", self.export_settings),
+            ("Import settings", self.import_settings),
+            ("Keyboard shortcuts", self.open_shortcuts),
+            ("Open 0.2 QoL center", self.open_qol_center),
+        ]
+        for name in ("general-chat", "random"):
+            if name in getattr(self, "server_channels", []):
+                commands.append((f"Jump to #{name}", lambda n=name: self.select_channel(n)))
+        for partner in getattr(self, "dm_partners", [])[:20]:
+            commands.append((f"Open DM @{partner}", lambda n=partner: self.select_dm_channel(n)))
+
+        def populate(text=""):
+            results.clear()
+            q = str(text).strip().lower()
+            matches = [(name, fn) for name, fn in commands if not q or q in name.lower()]
+            for name, fn in matches[:80]:
+                item = QListWidgetItem(name)
+                item.setData(Qt.UserRole, fn)
+                results.addItem(item)
+            if results.count():
+                results.setCurrentRow(0)
+        def run():
+            item = results.currentItem()
+            if item is None:
+                return
+            fn = item.data(Qt.UserRole)
+            dialog.accept()
+            QTimer.singleShot(0, fn)
+        query.textChanged.connect(populate)
+        query.returnPressed.connect(run)
+        results.itemDoubleClicked.connect(lambda _item: run())
+        populate()
+        query.setFocus()
+        dialog.exec()
+
+    def toggle_dnd_mode(self):
+        self.dnd_mode = not bool(self.dnd_mode)
+        self._save_drafts()
+        self.chat_status_label.setText("DND // notifications muted" if self.dnd_mode else "notifications enabled")
+
+    def open_qol_center(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // 0.2 QOL CENTER")
+        dialog.resize(680, 600)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        title = QLabel("NETRA 0.2 // QUALITY OF LIFE")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        subtitle = QLabel("Client-side controls available without changing Server.py.")
+        subtitle.setProperty("role", "muted")
+        layout.addWidget(subtitle)
+
+        grid = QGridLayout()
+        actions = [
+            ("🔎 SEARCH", self.global_search), ("⌨ SHORTCUTS", self.open_shortcuts),
+            ("🔔 NOTIFICATIONS", self.open_notification_center), ("😊 EMOJI", self.open_emoji_picker),
+            ("🎵 MUSIC", self.open_music_player), ("🖼 MEDIA", self.open_files_gallery),
+            ("🎙 VC", self.open_vc_room), ("🖥 SCREEN SHARE", self.open_screen_share),
+            ("⚙ SETTINGS", self.open_settings), ("🛠 DIAGNOSTICS", self.open_connection_diagnostics),
+            ("💾 EXPORT SETTINGS", self.export_settings), ("📥 IMPORT SETTINGS", self.import_settings),
+            ("🗑 FLUSH IMAGE CACHE", self.flush_image_cache), ("🐛 DEBUG LOG", self.open_debug_log),
+        ]
+        for i, (label, fn) in enumerate(actions):
+            btn = QPushButton(label)
+            btn.setMinimumHeight(38)
+            btn.clicked.connect(lambda checked=False, f=fn: (dialog.accept(), QTimer.singleShot(0, f)))
+            grid.addWidget(btn, i // 2, i % 2)
+        layout.addLayout(grid)
+
+        notify = QCheckBox("Notification sounds")
+        notify.setChecked(bool(self.notification_sound_enabled))
+        notify.toggled.connect(lambda v: (setattr(self, "notification_sound_enabled", bool(v)), self.settings.__setitem__("notification_sound_enabled", bool(v)), save_settings(self.settings)))
+        layout.addWidget(notify)
+        dnd = QCheckBox("Do Not Disturb")
+        dnd.setChecked(bool(self.dnd_mode))
+        dnd.toggled.connect(lambda v: (setattr(self, "dnd_mode", bool(v)), self._save_drafts()))
+        layout.addWidget(dnd)
+        backend = "DXCam/DXGI" if (DXCAM_AVAILABLE and CV2_AVAILABLE and os.name == "nt") else ("MSS fallback" if MSS_AVAILABLE else "PIL fallback")
+        layout.addWidget(QLabel(f"Screen capture backend: {backend}"))
+        layout.addStretch(1)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def open_shortcuts(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // KEYBOARD SHORTCUTS")
+        dialog.resize(560, 480)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        rows = [
+            ("Ctrl + K", "Command palette / search"),
+            ("Ctrl + E", "Emoji picker"),
+            ("Ctrl + Shift + N", "Notification center"),
+            ("Ctrl + L", "Focus message box"),
+            ("Ctrl + Shift + F", "Fullscreen"),
+            ("Ctrl + Shift + M", "Music player"),
+            ("Ctrl + Shift + V", "Open VC"),
+            ("Ctrl + Shift + S", "Screen share"),
+            ("F11", "Fullscreen"),
+            ("Esc", "Close overlays / fullscreen"),
+            ("Enter", "Send message"),
+            ("↑", "Edit last message when supported"),
+        ]
+        for key, desc in rows:
+            label = QLabel(f"{key:<20}  {desc}")
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(label)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def reset_ui_preferences(self):
+        self.settings["ui_scale"] = 100
+        self.settings["customization"] = {}
+        self.settings["theme"] = "NETRA Terminal"
+        self.ui_scale = 100
+        self.customization = {}
+        self.theme_name = "NETRA Terminal"
+        save_settings(self.settings)
+        self._apply_theme()
+        self.chat_status_label.setText("UI preferences reset")
+
+    def export_settings(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export NETRA Settings", "netra-settings.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, ensure_ascii=False, indent=2)
+            self.chat_status_label.setText("settings exported")
+        except Exception as exc:
+            self.show_error(f"Could not export settings: {exc}")
+
+    def import_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import NETRA Settings", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                incoming = json.load(f)
+            if not isinstance(incoming, dict):
+                raise ValueError("Settings file is not an object")
+            self.settings.update(incoming)
+            save_settings(self.settings)
+            self.chat_status_label.setText("settings imported — restart NETRA to apply everything")
+        except Exception as exc:
+            self.show_error(f"Could not import settings: {exc}")
+
+    def dragEnterEvent(self, event):
+        try:
+            if event.mimeData().hasUrls():
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+        except Exception:
+            event.ignore()
+
+    def dropEvent(self, event):
+        try:
+            urls = [u for u in event.mimeData().urls() if u.isLocalFile()]
+            if not urls:
+                event.ignore(); return
+            sent = 0
+            for url in urls:
+                path = url.toLocalFile()
+                if os.path.isfile(path):
+                    self._send_local_file_path(path)
+                    sent += 1
+            if sent:
+                self.chat_status_label.setText(f"queued {sent} dropped file{'s' if sent != 1 else ''}")
+            event.acceptProposedAction()
+        except Exception as exc:
+            self.show_error(f"Could not handle dropped files: {exc}")
+            event.ignore()
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_F11:
             self.toggle_fullscreen()
@@ -1525,12 +3679,28 @@ class FullDiscordClone(QMainWindow):
             self.showNormal()
             event.accept()
             return
-        if event.key() == Qt.Key_Control and self.voice_ptt:
+        if self.voice_ptt and self._ptt_key_pressed(event.key()):
             self.voice_ptt_down = True
+        if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_K:
+            self.open_command_palette(); event.accept(); return
+        if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_E:
+            self.open_emoji_picker(); event.accept(); return
+        if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_L:
+            self.message_entry.setFocus(); event.accept(); return
+        if event.modifiers() & Qt.ControlModifier and event.modifiers() & Qt.ShiftModifier and event.key() == Qt.Key_N:
+            self.open_notification_center(); event.accept(); return
+        if event.modifiers() & Qt.ControlModifier and event.modifiers() & Qt.ShiftModifier and event.key() == Qt.Key_F:
+            self.toggle_fullscreen(); event.accept(); return
+        if event.modifiers() & Qt.ControlModifier and event.modifiers() & Qt.ShiftModifier and event.key() == Qt.Key_M:
+            self.open_music_player(); event.accept(); return
+        if event.modifiers() & Qt.ControlModifier and event.modifiers() & Qt.ShiftModifier and event.key() == Qt.Key_V:
+            self.open_vc_room(); event.accept(); return
+        if event.modifiers() & Qt.ControlModifier and event.modifiers() & Qt.ShiftModifier and event.key() == Qt.Key_S:
+            self.open_screen_share(); event.accept(); return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        if event.key() == Qt.Key_Control and self.voice_ptt:
+        if self.voice_ptt and self._ptt_key_pressed(event.key()):
             self.voice_ptt_down = False
         super().keyReleaseEvent(event)
 
@@ -1644,8 +3814,19 @@ class FullDiscordClone(QMainWindow):
         self.offline_mode = False
         self._last_password = password
         self._last_auth_mode = mode
-        self.server_host = DEFAULT_HOST
-        self.server_port = PORT
+        # Keep the server selected by the user instead of resetting to the public default.
+        self.server_host = str(self.server_host).strip() or DEFAULT_HOST
+        try:
+            self.server_port = int(self.server_port)
+        except (TypeError, ValueError):
+            self.server_port = PORT
+        if not 1 <= self.server_port <= 65535:
+            self.server_port = PORT
+        self.settings["server_host"] = self.server_host
+        self.settings["server_port"] = self.server_port
+        save_settings(self.settings)
+        if hasattr(self, "server_ip_entry"):
+            self.server_ip_entry.setText(self.server_host)
         if self.client_socket:
             try:
                 self.client_socket.close()
@@ -1662,6 +3843,7 @@ class FullDiscordClone(QMainWindow):
                 pass
             sock.settimeout(None)
             self.client_socket = sock
+            self.connection_started_at = time.monotonic()
             self._reconnect_attempts = 0
             encoded = base64.b64encode(password.encode("utf-8")).decode("ascii")
             sock.sendall(f"{mode}:{username}:{encoded}\n".encode("utf-8"))
@@ -1686,6 +3868,7 @@ class FullDiscordClone(QMainWindow):
             self._start_smart_reconnect()
 
     def _network_disconnected(self):
+        self.last_disconnect_at = time.time()
         self.authenticated = False
         if self.offline_mode:
             self.server_status_label.setText("offline mode")
@@ -1740,7 +3923,9 @@ class FullDiscordClone(QMainWindow):
                 self.username = parts[2]
                 self.authenticated = True
                 self.offline_mode = False
+                self.connection_started_at = self.connection_started_at or time.monotonic()
                 self._stop_reconnect_timer()
+                self._broadcast_rich_presence()
                 # The server sends a burst of history immediately after AUTH_OK.
                 # Defer all expensive chat widget rebuilding and disk writes until
                 # READY so the Qt GUI remains responsive during login.
@@ -1755,6 +3940,11 @@ class FullDiscordClone(QMainWindow):
                     self.auth_dialog.accept()
                     self.auth_dialog = None
                 self.chat_status_label.setText("connected")
+                if self.last_disconnect_at:
+                    away = int(max(0, time.time() - self.last_disconnect_at))
+                    if away >= 30:
+                        self._show_while_away(away)
+                    self.last_disconnect_at = None
                 self.send_own_pfp()
             return
 
@@ -1777,6 +3967,11 @@ class FullDiscordClone(QMainWindow):
                 except Exception:
                     pass
                 self._refresh_dm_list()
+            return
+
+        # Music is client-local.  Ignore legacy server music packets so an older
+        # server cannot overwrite this user's private playlist or playback state.
+        if raw.startswith(("MUSIC_STATE:", "MUSIC_ADDED:", "MUSIC_ERROR:", "MUSIC_LISTEN:", "MUSIC_PCM:")):
             return
 
         if raw.startswith("VOICEUSERS:"):
@@ -1867,7 +4062,7 @@ class FullDiscordClone(QMainWindow):
                 if payload.get("file"):
                     self._register_file_metadata(payload.get("file"), msg)
                 if payload.get("sender") != my_name:
-                    self.play_ping_sound()
+                    self._notify_incoming(payload.get("room", "general-chat"), payload.get("sender", ""), payload.get("text", "New message"))
             except Exception:
                 pass
             return
@@ -1958,7 +4153,7 @@ class FullDiscordClone(QMainWindow):
             if len(p) == 4:
                 self.store_message(p[1], p[2], p[3], local=False)
                 if p[2] != my_name:
-                    self.play_ping_sound()
+                    self._notify_incoming(p[1], p[2], p[3])
             return
 
         if raw.startswith("GLOBAL:"):
@@ -1966,7 +4161,7 @@ class FullDiscordClone(QMainWindow):
             if len(p) == 3:
                 self.store_message("general-chat", p[1], p[2], local=False)
                 if p[1] != my_name:
-                    self.play_ping_sound()
+                    self._notify_incoming("general-chat", p[1], p[2])
             return
 
         if raw.startswith("DM:"):
@@ -1974,7 +4169,7 @@ class FullDiscordClone(QMainWindow):
             if len(p) == 4:
                 self.store_message(p[1], p[2], p[3], local=False)
                 if p[2] != my_name:
-                    self.play_ping_sound()
+                    self._notify_incoming(p[1], p[2], p[3])
             return
 
         if raw == "READY":
@@ -2031,6 +4226,37 @@ class FullDiscordClone(QMainWindow):
             if len(p) == 3:
                 old_name, new_name = p[1], p[2]
                 self._rename_local_history(old_name, new_name)
+            return
+
+        if raw.startswith("AUDIT:"):
+            try:
+                payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+                if not hasattr(self, "audit_log"):
+                    self.audit_log = []
+                self.audit_log.append(payload)
+            except Exception:
+                pass
+            return
+
+        if raw.startswith("PINNED:"):
+            try:
+                payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+                room = payload.get("room", self.current_target)
+                for msg in self.chat_history.get(room, []):
+                    if msg.get("id") == payload.get("message_id"):
+                        msg["pinned"] = bool(payload.get("pinned", True))
+                        break
+                self.reload_current_chat_view(preserve_scroll=True)
+            except Exception:
+                pass
+            return
+
+        if raw.startswith("UNDELETED:"):
+            try:
+                payload = json.loads(base64.b64decode(raw.split(":", 1)[1]).decode("utf-8"))
+                self.store_message(payload.get("room", self.current_target), payload.get("sender", self.username), payload.get("text", ""), message_id=payload.get("id"), reply_to=payload.get("reply_to"), reactions=payload.get("reactions") or {})
+            except Exception:
+                pass
             return
 
         if raw.startswith("EDITED:"):
@@ -2146,6 +4372,8 @@ class FullDiscordClone(QMainWindow):
         reply_to = dict(self.reply_target) if self.reply_target else None
         self.store_message(room, self.username, text, local=True, message_id=message_id, reply_to=reply_to)
         self.message_entry.clear()
+        self.drafts.pop(room, None)
+        self._save_drafts()
         payload = {
             "room": room,
             "id": message_id,
@@ -2226,16 +4454,21 @@ class FullDiscordClone(QMainWindow):
                     msg["file"] = payload
                     self._update_message_card(msg.get("id"), msg)
                     break
+            # Images are cached automatically so image messages can render without
+            # making the user press DOWNLOAD first. Other file types remain manual.
+            if str(payload.get("mime", "")).startswith("image/"):
+                self._download_file(payload, auto_open=self.auto_open_images)
         except Exception as exc:
             self.chat_status_label.setText(f"file offer error // {exc}")
 
-    def _download_file(self, file_meta):
+    def _download_file(self, file_meta, auto_open=True):
         if not file_meta:
             return
         file_id = file_meta.get("file_id")
         local = local_file_path(file_id, file_meta.get("name", "file"))
         if os.path.exists(local) and os.path.getsize(local) == int(file_meta.get("size", -1)):
-            self._open_local_file(local, file_meta)
+            if auto_open:
+                self._open_local_file(local, file_meta)
             return
         request = {"room": self.current_target, "file_id": file_id, "sender": file_meta.get("sender", "")}
         encoded = base64.b64encode(json.dumps(request, separators=(",", ":")).encode("utf-8")).decode("ascii")
@@ -2244,6 +4477,10 @@ class FullDiscordClone(QMainWindow):
 
     def _open_local_file(self, path, meta=None):
         try:
+            mime = str((meta or {}).get("mime", "")) or (mimetypes.guess_type(path)[0] or "")
+            if mime.startswith("image/"):
+                self.open_image_viewer(path)
+                return
             from PySide6.QtGui import QDesktopServices
             from PySide6.QtCore import QUrl
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -2389,6 +4626,345 @@ class FullDiscordClone(QMainWindow):
         except Exception:
             pass
 
+    def _member_item_clicked(self, item):
+        widget = self.members_list.itemWidget(item)
+        if widget is None:
+            return
+        name_labels = widget.findChildren(QLabel, "memberName")
+        if name_labels:
+            self.show_user_profile(name_labels[0].text().replace("  [YOU]", ""))
+
+    def show_user_profile(self, user):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"NETRA // PROFILE // {user}")
+        dialog.setFixedSize(420, 360)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        avatar = QLabel()
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedHeight(110)
+        avatar_img = self.user_pfps.get(user, Image.new("RGB", (96, 96), "#0F3D0F"))
+        avatar.setPixmap(self.pil_to_pixmap(avatar_img, (96, 96)))
+        layout.addWidget(avatar)
+        title = QLabel(user)
+        title.setProperty("role", "title")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        status = self.presence_status.get(user, "UNKNOWN")
+        custom = self.custom_status.get(user, "")
+        info = QLabel(f"STATUS: {status}\nCUSTOM: {custom or 'none'}\nVOICE: {'connected' if user in self.voice_users else 'not connected'}")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        layout.addStretch(1)
+        if user != self.username:
+            dm = QPushButton("MESSAGE")
+            dm.clicked.connect(lambda: (dialog.accept(), self.select_dm_channel(user)))
+            layout.addWidget(dm)
+        # These commands are harmless UI-side requests; the server decides permissions.
+        if self.authenticated and user != self.username:
+            mod = QPushButton("MODERATION / ROLES")
+            mod.clicked.connect(lambda: (dialog.accept(), self.open_moderation_panel(user)))
+            layout.addWidget(mod)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def open_moderation_panel(self, user):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"NETRA // MODERATION // {user}")
+        dialog.setFixedSize(420, 430)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"TARGET: {user}"))
+        role = QLineEdit()
+        role.setPlaceholderText("Role name for ADD/REMOVE ROLE")
+        layout.addWidget(role)
+        for label, command in (("ADD ROLE", "ROLE_ADD"), ("REMOVE ROLE", "ROLE_REMOVE"),
+                               ("TIMEOUT", "TIMEOUT"), ("KICK", "KICK"), ("BAN", "BAN")):
+            btn = QPushButton(label)
+            def send(cmd=command, target=user):
+                payload = {"target": target, "role": role.text().strip()} if cmd.startswith("ROLE_") else {"target": target}
+                if cmd == "TIMEOUT":
+                    payload["seconds"] = 60
+                enc = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+                self._network_send(f"{cmd}:{enc}")
+                dialog.accept()
+            btn.clicked.connect(send)
+            layout.addWidget(btn)
+        audit = QPushButton("OPEN AUDIT LOG")
+        audit.clicked.connect(lambda: (dialog.accept(), self.open_audit_log()))
+        layout.addWidget(audit)
+        dialog.exec()
+
+    def open_audit_log(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // AUDIT LOG")
+        dialog.resize(700, 520)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        view = QListWidget()
+        entries = getattr(self, "audit_log", [])
+        if not entries:
+            view.addItem("No audit events received by this client.")
+        else:
+            for entry in entries[-500:]:
+                view.addItem(str(entry))
+        layout.addWidget(view)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def edit_custom_status(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // CUSTOM STATUS")
+        dialog.setFixedSize(420, 180)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        entry = QLineEdit(self.custom_status.get(self.username, ""))
+        entry.setPlaceholderText("What are you doing?")
+        layout.addWidget(entry)
+        save = QPushButton("SAVE STATUS")
+        def save_status():
+            value = entry.text().strip()[:180]
+            self.custom_status[self.username] = value
+            self.presence_status[self.username] = self.presence_status.get(self.username, "online")
+            enc = base64.b64encode(json.dumps({"status": self.presence_status[self.username], "custom": value}, separators=(",", ":")).encode()).decode()
+            self._network_send(f"STATUS_SET:{enc}")
+            self._refresh_member_list()
+            dialog.accept()
+        save.clicked.connect(save_status)
+        layout.addWidget(save)
+        dialog.exec()
+
+    def global_search(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // GLOBAL SEARCH")
+        dialog.resize(760, 560)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        query = QLineEdit()
+        query.setPlaceholderText("Search messages, users, files…")
+        layout.addWidget(query)
+        results = QListWidget()
+        layout.addWidget(results, 1)
+        def run():
+            results.clear()
+            q = query.text().strip().lower()
+            if not q:
+                return
+            found = []
+            for room, messages in self.chat_history.items():
+                for msg in messages:
+                    hay = f"{room} {msg.get('sender','')} {msg.get('text','')}".lower()
+                    if q in hay:
+                        found.append((room, msg))
+            for room, msg in found[-300:][::-1]:
+                item = QListWidgetItem(f"#{room} // {msg.get('sender','?')}: {msg.get('text','')[:220]}")
+                item.setData(Qt.UserRole, (room, msg.get("id")))
+                results.addItem(item)
+            if not found:
+                results.addItem("No local cached matches.")
+        query.textChanged.connect(run)
+        def jump(item):
+            data = item.data(Qt.UserRole)
+            if data:
+                self.select_channel(data[0])
+                dialog.accept()
+        results.itemDoubleClicked.connect(jump)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def toggle_pin_message(self, message):
+        if not message or not message.get("id"):
+            return
+        room = self.current_target
+        mid = message["id"]
+        state = not bool(message.get("pinned"))
+        message["pinned"] = state
+        self.pinned_messages.setdefault(room, {})[mid] = message if state else None
+        if not state:
+            self.pinned_messages[room].pop(mid, None)
+        self._chat_cache_dirty = True
+        self._save_chat_cache()
+        payload = {"room": room, "message_id": mid, "pinned": state}
+        enc = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+        self._network_send(f"PIN:{enc}")
+        self.reload_current_chat_view(preserve_scroll=True)
+
+    def show_pinned_messages(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"NETRA // PINS // #{self.current_target}")
+        dialog.resize(700, 500)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        view = QListWidget()
+        for msg in self.chat_history.get(self.current_target, []):
+            if msg.get("pinned"):
+                view.addItem(f"{msg.get('sender','?')}: {msg.get('text','')[:300]}")
+        if not view.count():
+            view.addItem("No pinned messages in this channel.")
+        layout.addWidget(view, 1)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def edit_message(self, message):
+        if not message or message.get("sender") != self.username:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // EDIT MESSAGE")
+        dialog.setFixedSize(520, 190)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        entry = QLineEdit(message.get("text", ""))
+        layout.addWidget(entry)
+        save = QPushButton("SAVE EDIT")
+        def commit():
+            text = entry.text().strip()
+            if not text:
+                return
+            message["text"] = text
+            message["edited"] = True
+            payload = {"room": self.current_target, "message_id": message.get("id"), "text": text}
+            enc = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+            self._network_send(f"EDIT:{enc}")
+            self._save_chat_cache()
+            self.reload_current_chat_view(preserve_scroll=True)
+            dialog.accept()
+        save.clicked.connect(commit)
+        entry.returnPressed.connect(commit)
+        layout.addWidget(save)
+        dialog.exec()
+
+    def open_thread(self, message):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // THREAD")
+        dialog.resize(650, 520)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        root = QLabel(f"THREAD ROOT // {message.get('sender','?')}: {message.get('text','')}")
+        root.setWordWrap(True)
+        layout.addWidget(root)
+        view = QListWidget()
+        root_id = message.get("id")
+        replies = []
+        for msg in self.chat_history.get(self.current_target, []):
+            if (msg.get("reply_to") or {}).get("id") == root_id:
+                replies.append(msg)
+        for reply in replies:
+            view.addItem(f"{reply.get('sender','?')}: {reply.get('text','')}")
+        if not replies:
+            view.addItem("No replies cached for this thread.")
+        layout.addWidget(view, 1)
+        reply = QPushButton("REPLY IN THREAD")
+        reply.clicked.connect(lambda: (dialog.accept(), self._set_reply_target(message)))
+        layout.addWidget(reply)
+        dialog.exec()
+
+    def toggle_channel_notifications(self):
+        room = self.current_target
+        current = self.notification_settings.get(room, True)
+        self.notification_settings[room] = not current
+        self.settings["notification_settings"] = dict(self.notification_settings)
+        save_settings(self.settings)
+        self.notify_button.setText("NOTIFY" if self.notification_settings[room] else "MUTED")
+
+    def open_files_gallery(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("NETRA // FILES / IMAGE GALLERY")
+        dialog.resize(820, 600)
+        dialog.setStyleSheet(self.dialog_qss())
+        layout = QVBoxLayout(dialog)
+        view = QListWidget()
+        files = []
+        for name in os.listdir(FILE_CACHE_DIR):
+            path = os.path.join(FILE_CACHE_DIR, name)
+            if os.path.isfile(path) and not name.endswith(".part"):
+                files.append(path)
+        for path in sorted(files, key=os.path.getmtime, reverse=True):
+            item = QListWidgetItem(f"{os.path.basename(path)}  //  {format_file_size(os.path.getsize(path))}")
+            item.setData(Qt.UserRole, path)
+            view.addItem(item)
+        if not files:
+            view.addItem("No cached files yet.")
+        view.itemDoubleClicked.connect(lambda item: self._open_local_file(item.data(Qt.UserRole)) if item.data(Qt.UserRole) else None)
+        layout.addWidget(view, 1)
+        flush = QPushButton("FLUSH IMAGE CACHE")
+        flush.clicked.connect(self.flush_image_cache)
+        layout.addWidget(flush)
+        close = QPushButton("CLOSE")
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close)
+        dialog.exec()
+
+    def flush_image_cache(self):
+        removed = 0
+        for name in os.listdir(FILE_CACHE_DIR):
+            path = os.path.join(FILE_CACHE_DIR, name)
+            if os.path.isfile(path) and not name.endswith(".part"):
+                try:
+                    mime = mimetypes.guess_type(path)[0] or ""
+                    if mime.startswith("image/"):
+                        os.remove(path); removed += 1
+                except Exception:
+                    pass
+        self.chat_status_label.setText(f"image cache flushed // {removed} removed")
+        self.reload_current_chat_view(preserve_scroll=True)
+
+    def paste_clipboard_image(self):
+        clipboard = QApplication.clipboard()
+        image = clipboard.image()
+        if image.isNull():
+            self.show_error("Clipboard does not contain an image.")
+            return
+        path = os.path.join(FILE_CACHE_DIR, f"clipboard_{uuid.uuid4().hex}.png")
+        if not image.save(path, "PNG"):
+            self.show_error("Could not save the clipboard image.")
+            return
+        self._send_local_file_path(path)
+
+    def _send_local_file_path(self, path):
+        # Reuse the normal file sender by temporarily routing through its metadata path.
+        try:
+            size = os.path.getsize(path)
+            if size > MAX_FILE_SIZE:
+                self.show_error("Clipboard image is too large.")
+                return
+            file_id = uuid.uuid4().hex
+            mime = mimetypes.guess_type(path)[0] or "image/png"
+            meta = {"file_id": file_id, "name": os.path.basename(path), "size": size, "mime": mime,
+                    "sha256": self._file_digest(path), "sender": self.username, "room": self.current_target}
+            # local_file_path uses the file id, so copy into the canonical cache location.
+            target = local_file_path(file_id, meta["name"])
+            if os.path.abspath(path) != os.path.abspath(target):
+                with open(path, "rb") as src, open(target, "wb") as dst: dst.write(src.read())
+            payload = {"room": self.current_target, "id": uuid.uuid4().hex, "text": "", "file": meta, "kind": "file"}
+            meta["message_id"] = payload["id"]
+            self._pending_file_sends[file_id] = meta
+            self.store_message(self.current_target, self.username, "", local=True, message_id=payload["id"], kind="file", file_meta=meta)
+            enc = base64.b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).decode()
+            self._network_send(f"MESSAGE:{enc}")
+            threading.Thread(target=self._send_file_chunks, args=(meta,), daemon=True).start()
+        except Exception as exc:
+            self.show_error(f"Could not paste image: {exc}")
+
+    def open_first_url(self, text):
+        import re
+        match = re.search(r"https?://[^\\s<>]+", str(text))
+        if not match:
+            return
+        try:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(match.group(0)))
+        except Exception:
+            pass
+
     def _set_reply_target(self, message):
         if not message:
             return
@@ -2406,6 +4982,27 @@ class FullDiscordClone(QMainWindow):
         if hasattr(self, "reply_banner"):
             self.reply_banner.setVisible(False)
             self.reply_banner_label.clear()
+
+    def _copy_message_text(self, message):
+        try:
+            text = str((message or {}).get("text", ""))
+            if not text and (message or {}).get("file"):
+                file_meta = message.get("file") or {}
+                text = str(file_meta.get("name", ""))
+            QApplication.clipboard().setText(text)
+            self.chat_status_label.setText("message copied")
+        except Exception as exc:
+            self.show_error(f"Could not copy message: {exc}")
+
+    def _copy_message_id(self, message):
+        try:
+            mid = str((message or {}).get("id", ""))
+            if not mid:
+                return
+            QApplication.clipboard().setText(mid)
+            self.chat_status_label.setText("message ID copied")
+        except Exception as exc:
+            self.show_error(f"Could not copy message ID: {exc}")
 
     def _react_to_message(self, message):
         if not message or not self.authenticated:
@@ -2436,7 +5033,48 @@ class FullDiscordClone(QMainWindow):
         encoded = base64.b64encode(json.dumps({
             "room": self.current_target, "message_id": message.get("id", "")
         }, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self.deleted_undo = (self.current_target, dict(message))
         self._network_send(f"DELETE:{encoded}")
+        self._show_undo_delete_banner()
+
+    def _show_undo_delete_banner(self):
+        if not self.deleted_undo or not hasattr(self, "reply_banner"):
+            return
+        room, msg = self.deleted_undo
+        self.reply_banner_label.setText(f"MESSAGE DELETED: {msg.get('text','')[:100]}")
+        self.reply_banner.setVisible(True)
+        self.reply_cancel_button.setText("UNDO")
+        try:
+            self.reply_cancel_button.clicked.disconnect()
+        except Exception:
+            pass
+        self.reply_cancel_button.clicked.connect(self.undo_delete_message)
+        QTimer.singleShot(6000, self._clear_undo_delete_banner)
+
+    def undo_delete_message(self):
+        if not self.deleted_undo:
+            return
+        room, msg = self.deleted_undo
+        payload = dict(msg)
+        enc = base64.b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).decode()
+        self._network_send(f"UNDELETE:{enc}")
+        self.store_message(room, payload.get("sender", self.username), payload.get("text", ""), local=True, message_id=payload.get("id"), reply_to=payload.get("reply_to"), reactions=payload.get("reactions") or {})
+        self.deleted_undo = None
+        self._clear_undo_delete_banner()
+        self.reload_current_chat_view(preserve_scroll=True)
+
+    def _clear_undo_delete_banner(self):
+        if not hasattr(self, "reply_banner"):
+            return
+        if self.deleted_undo is None:
+            self.reply_banner.setVisible(False)
+            self.reply_banner_label.clear()
+            try:
+                self.reply_cancel_button.clicked.disconnect()
+            except Exception:
+                pass
+            self.reply_cancel_button.clicked.connect(self._clear_reply_target)
+            self.reply_cancel_button.setText("CANCEL")
 
     def _add_file_embed(self, body, msg):
         meta = msg.get("file") or {}
@@ -2496,10 +5134,16 @@ class FullDiscordClone(QMainWindow):
         self._save_chat_cache()
 
     def select_channel(self, channel):
+        self._save_current_draft()
         self.current_target = channel
+        self.recent_targets = [x for x in self.recent_targets if x != channel] + [channel]
+        self._mark_room_read(channel)
+        self._broadcast_rich_presence()
         self.chat_title_label.setText(f"# {channel}")
         self.message_entry.setPlaceholderText(f"Message #{channel}")
         self._highlight_channel(channel)
+        self._restore_draft(channel)
+        self._save_drafts()
         self.reload_current_chat_view()
 
     def show_server_view(self):
@@ -2517,9 +5161,15 @@ class FullDiscordClone(QMainWindow):
             self.reload_current_chat_view()
 
     def select_dm_channel(self, partner):
+        self._save_current_draft()
         self.current_target = partner
+        self.recent_targets = [x for x in self.recent_targets if x != partner] + [partner]
+        self._mark_room_read(partner)
+        self._broadcast_rich_presence()
         self.chat_title_label.setText(f"@ {partner}")
         self.message_entry.setPlaceholderText(f"Message @{partner}")
+        self._restore_draft(partner)
+        self._save_drafts()
         self.reload_current_chat_view()
 
     def _highlight_channel(self, target):
@@ -2546,10 +5196,19 @@ class FullDiscordClone(QMainWindow):
         self.dm_partners = sorted(set(partners), key=str.lower)
         self.dm_list.clear()
         for partner in self.dm_partners:
-            self.dm_list.addItem(f"@ {partner}")
+            unread = int(self.unread_counts.get(partner, 0))
+            label = f"@ {partner}" + (f"  ({unread})" if unread else "")
+            item = QListWidgetItem(label)
+            if unread:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            self.dm_list.addItem(item)
 
     def _dm_item_clicked(self, item):
         text = item.text().removeprefix("@ ")
+        if "  (" in text:
+            text = text.rsplit("  (", 1)[0]
         if text:
             self.select_dm_channel(text)
 
@@ -2585,12 +5244,13 @@ class FullDiscordClone(QMainWindow):
             text_col.addWidget(online_label)
         layout.addLayout(text_col, 1)
         if voice:
-            wave = QLabel("[.....]")
+            wave = QLabel("▁▂▃▄▅▆▇")
             wave.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            wave.setFixedWidth(58)
-            wave.setStyleSheet(f"color:{self.palette_colors()['dim']}; font-family:Consolas; font-size:11px; font-weight:700;")
+            wave.setFixedWidth(72)
+            wave.setStyleSheet(f"color:{self.palette_colors()['dim']}; font-family:Consolas; font-size:12px; font-weight:700;")
             layout.addWidget(wave)
             self.voice_wave_labels[user] = wave
+            self.voice_wave_state.setdefault(user, {"level": 0.0, "peak": 0.0, "history": [0.0] * 7})
         dot = QLabel("●")
         dot.setStyleSheet(f"color:{self.palette_colors()['bright'] if online else self.palette_colors()['faint']};")
         layout.addWidget(dot, alignment=Qt.AlignRight | Qt.AlignVCenter)
@@ -2614,10 +5274,12 @@ class FullDiscordClone(QMainWindow):
     def _refresh_voice_users(self):
         self.voice_user_list.clear()
         self.voice_wave_labels = {}
+        self.voice_wave_state = {}
         for user in self.voice_users:
             widget = self._make_member_widget(user, online=True, voice=True)
             self._add_widget_item(self.voice_user_list, widget, 44)
         self._refresh_voice_user_settings()
+        self._refresh_voice_hud()
 
     def _capture_chat_scroll_anchor(self):
         if not hasattr(self, "chat_scroll"):
@@ -2728,10 +5390,33 @@ class FullDiscordClone(QMainWindow):
         reply_btn.setObjectName("messageActionButton")
         reply_btn.clicked.connect(lambda _=False, m=msg: self._set_reply_target(m))
         actions_layout.addWidget(reply_btn)
+        copy_btn = QPushButton("COPY")
+        copy_btn.setObjectName("messageActionButton")
+        copy_btn.setToolTip("Copy message text")
+        copy_btn.clicked.connect(lambda _=False, m=msg: self._copy_message_text(m))
+        actions_layout.addWidget(copy_btn)
+        copy_id_btn = QPushButton("ID")
+        copy_id_btn.setObjectName("messageActionButton")
+        copy_id_btn.setToolTip("Copy message ID")
+        copy_id_btn.clicked.connect(lambda _=False, m=msg: self._copy_message_id(m))
+        actions_layout.addWidget(copy_id_btn)
         react_btn = QPushButton("REACT")
         react_btn.setObjectName("messageActionButton")
         react_btn.clicked.connect(lambda _=False, m=msg: self._react_to_message(m))
         actions_layout.addWidget(react_btn)
+        thread_btn = QPushButton("THREAD")
+        thread_btn.setObjectName("messageActionButton")
+        thread_btn.clicked.connect(lambda _=False, m=msg: self.open_thread(m))
+        actions_layout.addWidget(thread_btn)
+        pin_btn = QPushButton("UNPIN" if msg.get("pinned") else "PIN")
+        pin_btn.setObjectName("messageActionButton")
+        pin_btn.clicked.connect(lambda _=False, m=msg: self.toggle_pin_message(m))
+        actions_layout.addWidget(pin_btn)
+        if sender == self.username:
+            edit_btn = QPushButton("EDIT")
+            edit_btn.setObjectName("messageActionButton")
+            edit_btn.clicked.connect(lambda _=False, m=msg: self.edit_message(m))
+            actions_layout.addWidget(edit_btn)
         if sender == self.username:
             delete_btn = QPushButton("DELETE")
             delete_btn.setObjectName("messageActionButton")
@@ -2773,6 +5458,12 @@ class FullDiscordClone(QMainWindow):
             msg_label.setProperty("role", "messageText")
             msg_label.setWordWrap(True)
             body.addWidget(msg_label)
+            lower = str(text).lower()
+            if "youtube.com/watch?v=" in lower or "youtu.be/" in lower or "youtube.com/shorts/" in lower:
+                yt = QPushButton("▶ OPEN YOUTUBE")
+                yt.setObjectName("messageActionButton")
+                yt.clicked.connect(lambda _=False, t=text: self.open_first_url(t))
+                body.addWidget(yt, alignment=Qt.AlignLeft)
 
         reaction_text = []
         for emoji, users in (msg.get("reactions") or {}).items():
@@ -2848,6 +5539,11 @@ class FullDiscordClone(QMainWindow):
             self.user_pfps[sender] = img
             self._refresh_member_list()
             self._refresh_voice_users()
+            # PFPs are sent separately from chat history during login.
+            # Refresh the current message view so cached/history messages
+            # replace the green fallback avatar as soon as the PFP arrives.
+            if self.current_target:
+                self.reload_current_chat_view()
         except Exception:
             pass
 
@@ -2892,7 +5588,9 @@ class FullDiscordClone(QMainWindow):
             path = generate_ping_wav(mode)
             if os.name == "nt":
                 import winsound
-                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                winsound.PlaySound(None, 0)
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+                return
         except Exception:
             pass
 
@@ -3105,11 +5803,52 @@ class FullDiscordClone(QMainWindow):
         if self.voice_record_wave:
             self.voice_record_wave.writeframes(playback)
 
+    def _stop_music_listener(self):
+        self._stop_local_music()
+
+    def _toggle_music_listener(self):
+        if self.music_listening or self.music_state.get("playing"):
+            self.music_listening = False
+            self._stop_local_music()
+        else:
+            if not SOUNDDEVICE_AVAILABLE:
+                self.show_error("Local music playback requires sounddevice. Install it with:\npython -m pip install sounddevice")
+                return
+            if not AV_AVAILABLE:
+                self.show_error("Local music playback requires PyAV. Install it with:\npython -m pip install av")
+                return
+            self.music_listening = True
+            self._play_local_music()
+        self._refresh_music_dialog()
+
     def toggle_voice_mute(self):
         self.voice_muted = not self.voice_muted
-        self.voice_mute_button.setText("UNMUTE MIC" if self.voice_muted else "MUTE MIC")
+        if hasattr(self, "voice_mute_button"):
+            self.voice_mute_button.setText("UNMUTE MIC" if self.voice_muted else "MUTE MIC")
+        self._refresh_voice_hud()
+
+    def toggle_deafen(self):
+        self.voice_deafened = not self.voice_deafened
+        self.settings["voice_deafen"] = self.voice_deafened
+        save_settings(self.settings)
+        if hasattr(self, "voice_deafen_button"):
+            self.voice_deafen_button.setText("UNDEAFEN" if self.voice_deafened else "DEAFEN")
+        self._refresh_voice_hud()
+        # Deafen only affects incoming voice.  Keep the microphone running.
+        if self.voice_deafened:
+            try:
+                while True:
+                    self.voice_play_queue.get_nowait()
+            except Exception:
+                pass
 
     def stop_voice_chat(self):
+        self.voice_hud_expanded = False
+        if hasattr(self, "chat_scroll"):
+            self.chat_scroll.setVisible(True)
+        if hasattr(self, "voice_hud_expanded_panel"):
+            self.voice_hud_expanded_panel.setVisible(False)
+            self.voice_hud_scroll.setVisible(True)
         was_active = self.in_voice_chat
         self.in_voice_chat = False
         if was_active:
@@ -3126,8 +5865,12 @@ class FullDiscordClone(QMainWindow):
         self.voice_resamplers.clear()
         self.voice_levels.clear()
         self.voice_wave_labels = {}
+        self.voice_wave_state = {}
         self.voice_send_resampler = None
         self.voice_button.setText("JOIN VOICE")
+        if self.screen_sharing:
+            self._stop_screen_share_capture()
+        self._refresh_voice_hud()
         self.chat_status_label.setText("connected" if self.authenticated else "offline")
 
     def _update_voice_stats(self):
@@ -3140,28 +5883,43 @@ class FullDiscordClone(QMainWindow):
         elif hasattr(self, "voice_stats_label"):
             self.voice_stats_label.setText("voice offline")
 
-        if hasattr(self, "voice_radar_label"):
-            now = time.monotonic()
-            active = []
-            for user in self.voice_users:
-                age = now - float(self.voice_activity.get(user, 0.0))
-                level = float(self.voice_levels.get(user, 0.0))
-                if age > 0.25:
-                    level *= max(0.0, 1.0 - (age - 0.25) / 0.9)
-                filled = max(0, min(5, int(level * 5.0 + 0.5)))
-                wave = "[" + ("|" * filled) + ("." * (5 - filled)) + "]"
-                label = self.voice_wave_labels.get(user)
-                if label:
-                    label.setText(wave)
-                    label.setStyleSheet(f"color:{self.palette_colors()['bright'] if level > 0.025 else self.palette_colors()['dim']}; font-family:Consolas; font-size:10px; font-weight:700;")
-                if level > 0.025 and age < 1.2:
-                    active.append(user if user != self.username else "YOU")
-            if active:
-                self.voice_radar_label.setText("VOICE RADAR\n" + "  ".join(active))
-            elif self.voice_users:
-                self.voice_radar_label.setText("VOICE RADAR\nlistening…")
-            else:
-                self.voice_radar_label.setText("VOICE RADAR\nno one connected")
+        now = time.monotonic()
+        bright = self.palette_colors()["bright"]
+        dim = self.palette_colors()["dim"]
+        levels = list(self.voice_levels.items())
+        for user in self.voice_users:
+            raw = max(0.0, min(1.0, float(self.voice_levels.get(user, 0.0))))
+            age = now - float(self.voice_activity.get(user, 0.0))
+            if age > 0.12:
+                raw *= max(0.0, 1.0 - (age - 0.12) / 0.85)
+            state = self.voice_wave_state.setdefault(user, {"level": 0.0, "peak": 0.0, "history": [0.0] * 7})
+            # Fast attack, slower release gives speech a lively but stable meter.
+            old = state["level"]
+            state["level"] = old + (raw - old) * (0.55 if raw > old else 0.18)
+            state["peak"] = max(state["level"], state["peak"] * 0.94)
+            hist = state["history"]
+            hist.append(state["level"])
+            del hist[:-7]
+            label = self.voice_wave_labels.get(user)
+            if label:
+                bars = "▁▂▃▄▅▆▇█"
+                wave = "".join(bars[min(7, int(max(0.0, v) * 8.0))] for v in hist)
+                label.setText(wave)
+                label.setStyleSheet(f"color:{bright if state['level'] > 0.035 else dim}; font-family:Consolas; font-size:12px; font-weight:700;")
+            if state["level"] > 0.035 and age < 1.2:
+                self.voice_radar_label.setText(
+                    "VOICE RADAR\n" + "  ".join(
+                        (u if u != self.username else "YOU") for u in self.voice_users
+                        if self.voice_wave_state.get(u, {}).get("level", 0.0) > 0.035
+                    )
+                )
+
+        if self.voice_users and not any(self.voice_wave_state.get(u, {}).get("level", 0.0) > 0.035 for u in self.voice_users):
+            self.voice_radar_label.setText("VOICE RADAR\nlistening…")
+        elif not self.voice_users:
+            self.voice_radar_label.setText("VOICE RADAR\nno one connected")
+
+        self._update_voice_hud()
 
     # ---------- misc ----------
 
@@ -3222,9 +5980,31 @@ class FullDiscordClone(QMainWindow):
                 "voice_record": self.voice_recording,
                 "voice_user_volumes": self.voice_user_volumes,
                 "voice_user_mutes": self.voice_user_mutes,
+                "notification_settings": self.notification_settings,
+                "notification_history": self.notification_history[-200:],
+                "rich_presence": self.rich_presence,
+                "customization": self.customization,
+                "music_playlists": self.music_playlists,
+                "active_playlist": self.active_playlist,
+                "client_plugins": self.client_plugins,
+                "server_plugins": self.server_plugins,
+                "developer_mode": self.developer_mode,
+                "screen_share_quality": self.screen_share_quality,
+            "screen_share_source": self.screen_share_source,
+            "screen_share_fps": self.screen_share_fps,
+            "screen_share_cursor": self.screen_share_cursor,
+                "offline_mode": self.offline_mode,
                 "voice_input_device": self._audio_selection_to_index(self.input_device_combo.currentText()) if hasattr(self, "input_device_combo") else self.settings.get("voice_input_device"),
                 "voice_output_device": self._audio_selection_to_index(self.output_device_combo.currentText()) if hasattr(self, "output_device_combo") else self.settings.get("voice_output_device"),
+                "remember_username": self.remember_username,
+                "auto_open_images": self.auto_open_images,
+                "desktop_notifications": self.desktop_notifications,
+                "notification_sound_enabled": self.notification_sound_enabled,
+                "ui_scale": self.ui_scale,
+                "ptt_key": self.ptt_key,
+                "debug_log": self.debug_log[-1000:],
             })
+            self._save_feature_settings()
             save_settings(self.settings)
             self._save_chat_cache()
         except Exception:
